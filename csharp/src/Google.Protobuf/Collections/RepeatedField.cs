@@ -133,7 +133,7 @@ namespace Google.Protobuf.Collections
                     //
                     // Check that the supplied length doesn't exceed the underlying buffer.
                     // That prevents a malicious length from initializing a very large collection.
-                    if (codec.FixedSize > 0 && length % codec.FixedSize == 0 && IsDataAvailable(ref ctx, length))
+                    if (codec.FixedSize > 0 && length % codec.FixedSize == 0 && ParsingPrimitives.IsDataAvailable(ref ctx.state, length))
                     {
                         EnsureSize(count + (length / codec.FixedSize));
 
@@ -167,29 +167,11 @@ namespace Google.Protobuf.Collections
             }
         }
 
-        private bool IsDataAvailable(ref ParseContext ctx, int size)
-        {
-            // Data fits in remaining buffer
-            if (size <= ctx.state.bufferSize - ctx.state.bufferPos)
-            {
-                return true;
-            }
-
-            // Data fits in remaining source data.
-            // Note that this will never be true when reading from a stream as the total length is unknown.
-            if (size < ctx.state.segmentedBufferHelper.TotalLength - ctx.state.totalBytesRetired - ctx.state.bufferPos)
-            {
-                return true;
-            }
-
-            return false;
-        }
-
         /// <summary>
         /// Calculates the size of this collection based on the given codec.
         /// </summary>
         /// <param name="codec">The codec to use when encoding each field.</param>
-        /// <returns>The number of bytes that would be written to a <see cref="CodedOutputStream"/> by <see cref="WriteTo"/>,
+        /// <returns>The number of bytes that would be written to an output by one of the <c>WriteTo</c> methods,
         /// using the same codec.</returns>
         public int CalculateSize(FieldCodec<T> codec)
         {
@@ -248,6 +230,26 @@ namespace Google.Protobuf.Collections
         /// <param name="codec">The codec to use when encoding each value.</param>
         public void WriteTo(CodedOutputStream output, FieldCodec<T> codec)
         {
+            WriteContext.Initialize(output, out WriteContext ctx);
+            try
+            {
+                WriteTo(ref ctx, codec);
+            }
+            finally
+            {
+                ctx.CopyStateTo(output);
+            }
+        }
+
+        /// <summary>
+        /// Writes the contents of this collection to the given write context,
+        /// encoding each value using the specified codec.
+        /// </summary>
+        /// <param name="ctx">The write context to write to.</param>
+        /// <param name="codec">The codec to use when encoding each value.</param>
+        [SecuritySafeCritical]
+        public void WriteTo(ref WriteContext ctx, FieldCodec<T> codec)
+        {
             if (count == 0)
             {
                 return;
@@ -257,12 +259,12 @@ namespace Google.Protobuf.Collections
             if (codec.PackedRepeatedField)
             {
                 // Packed primitive type
-                uint size = (uint)CalculatePackedDataSize(codec);
-                output.WriteTag(tag);
-                output.WriteRawVarint32(size);
+                int size = CalculatePackedDataSize(codec);
+                ctx.WriteTag(tag);
+                ctx.WriteLength(size);
                 for (int i = 0; i < count; i++)
                 {
-                    writer(output, array[i]);
+                    writer(ref ctx, array[i]);
                 }
             }
             else
@@ -271,11 +273,11 @@ namespace Google.Protobuf.Collections
                 // Can't use codec.WriteTagAndValue, as that omits default values.
                 for (int i = 0; i < count; i++)
                 {
-                    output.WriteTag(tag);
-                    writer(output, array[i]);
+                    ctx.WriteTag(tag);
+                    writer(ref ctx, array[i]);
                     if (codec.EndTag != 0)
                     {
-                        output.WriteTag(codec.EndTag);
+                        ctx.WriteTag(codec.EndTag);
                     }
                 }
             }

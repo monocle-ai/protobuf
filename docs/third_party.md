@@ -18,6 +18,7 @@ These are projects we know about implementing Protocol Buffers for other program
 * C: https://github.com/squidfunk/protobluff
 * C: https://github.com/eerimoq/pbtools
 * C++: https://github.com/google/protobuf (Google-official implementation)
+* C++: https://EmbeddedProto.com
 * C/C++: http://spbc.sf.net/
 * C#: http://code.google.com/p/protobuf-csharp-port
 * C#: https://silentorbit.com/protobuf/
@@ -35,6 +36,7 @@ These are projects we know about implementing Protocol Buffers for other program
 * Delphi: http://fundementals.sourceforge.net/dl.html
 * Elixir: https://github.com/jeremyong/exprotoc
 * Elixir: https://github.com/tony612/protobuf-elixir
+* Elixir: https://github.com/ahamez/protox
 * Elm: https://github.com/tiziano88/elm-protobuf
 * Erlang: https://github.com/tomas-abrahamsson/gpb
 * Erlang: http://piqi.org/

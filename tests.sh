@@ -305,8 +305,6 @@ build_objectivec_tvos_release() {
 }
 
 build_objectivec_cocoapods_integration() {
-  # Update pod to the latest version.
-  gem install cocoapods --no_document
   objectivec/Tests/CocoaPods/run_tests.sh
 }
 
@@ -457,48 +455,16 @@ build_javascript() {
   cd conformance && make test_nodejs && cd ..
 }
 
-generate_php_test_proto() {
-  internal_build_cpp
-  pushd php/tests
-  # Generate test file
-  rm -rf generated
-  mkdir generated
-  ../../src/protoc --php_out=generated         \
-    -I../../src -I.                            \
-    proto/empty/echo.proto                     \
-    proto/test.proto                           \
-    proto/test_include.proto                   \
-    proto/test_no_namespace.proto              \
-    proto/test_prefix.proto                    \
-    proto/test_php_namespace.proto             \
-    proto/test_empty_php_namespace.proto       \
-    proto/test_reserved_enum_lower.proto       \
-    proto/test_reserved_enum_upper.proto       \
-    proto/test_reserved_enum_value_lower.proto \
-    proto/test_reserved_enum_value_upper.proto \
-    proto/test_reserved_message_lower.proto    \
-    proto/test_reserved_message_upper.proto    \
-    proto/test_service.proto                   \
-    proto/test_service_namespace.proto         \
-    proto/test_wrapper_type_setters.proto      \
-    proto/test_descriptors.proto
-  pushd ../../src
-  ./protoc --php_out=../php/tests/generated -I../php/tests -I. \
-    ../php/tests/proto/test_import_descriptor_proto.proto
-  popd
-  popd
-}
-
 use_php() {
   VERSION=$1
   export PATH=/usr/local/php-${VERSION}/bin:$PATH
-  generate_php_test_proto
+  internal_build_cpp
 }
 
 use_php_zts() {
   VERSION=$1
   export PATH=/usr/local/php-${VERSION}-zts/bin:$PATH
-  generate_php_test_proto
+  internal_build_cpp
 }
 
 build_php5.5() {
@@ -507,49 +473,9 @@ build_php5.5() {
   pushd php
   rm -rf vendor
   composer update
-  ./vendor/bin/phpunit
+  composer test
   popd
-  pushd conformance
-  make test_php
-  popd
-}
-
-build_php5.5_c() {
-  IS_64BIT=$1
-  use_php 5.5
-  php/tests/test.sh
-  pushd conformance
-  if [ "$IS_64BIT" = "true" ]
-  then
-    make test_php_c
-  else
-    make test_php_c_32
-  fi
-  popd
-}
-
-build_php5.5_mixed() {
-  use_php 5.5
-  pushd php
-  rm -rf vendor
-  composer update
-  tests/compile_extension.sh
-  php -dextension=./ext/google/protobuf/modules/protobuf.so ./vendor/bin/phpunit
-  popd
-}
-
-build_php5.5_zts_c() {
-  IS_64BIT=$1
-  use_php_zts 5.5
-  php/tests/test.sh
-  pushd conformance
-  if [ "$IS_64BIT" = "true" ]
-  then
-    make test_php_c
-  else
-    make test_php_c_32
-  fi
-  popd
+  (cd conformance && make test_php)
 }
 
 build_php5.6() {
@@ -557,72 +483,27 @@ build_php5.6() {
   pushd php
   rm -rf vendor
   composer update
-  ./vendor/bin/phpunit
+  composer test
   popd
-  pushd conformance
-  make test_php
-  popd
-}
-
-build_php5.6_c() {
-  IS_64BIT=$1
-  use_php 5.6
-  php/tests/test.sh
-  pushd conformance
-  if [ "$IS_64BIT" = "true" ]
-  then
-    make test_php_c
-  else
-    make test_php_c_32
-  fi
-  popd
-}
-
-build_php5.6_mixed() {
-  use_php 5.6
-  pushd php
-  rm -rf vendor
-  composer update
-  tests/compile_extension.sh
-  php -dextension=./ext/google/protobuf/modules/protobuf.so ./vendor/bin/phpunit
-  popd
-}
-
-build_php5.6_zts_c() {
-  IS_64BIT=$1
-  use_php_zts 5.6
-  php/tests/test.sh
-  pushd conformance
-  if [ "$IS_64BIT" = "true" ]
-  then
-    make test_php_c
-  else
-    make test_php_c_32
-  fi
-  popd
+  (cd conformance && make test_php)
 }
 
 build_php5.6_mac() {
-  generate_php_test_proto
   # Install PHP
   curl -s https://php-osx.liip.ch/install.sh | bash -s 5.6
   PHP_FOLDER=`find /usr/local -type d -name "php5-5.6*"`  # The folder name may change upon time
   test ! -z "$PHP_FOLDER"
   export PATH="$PHP_FOLDER/bin:$PATH"
 
-  # Install phpunit
-  curl https://phar.phpunit.de/phpunit-5.6.8.phar -L -o phpunit.phar
-  chmod +x phpunit.phar
-  sudo mv phpunit.phar /usr/local/bin/phpunit
+  internal_build_cpp
 
-  # Install valgrind
-  echo "#! /bin/bash" > valgrind
-  chmod ug+x valgrind
-  sudo mv valgrind /usr/local/bin/valgrind
-
-  # Test
-  php/tests/test.sh
-  (cd conformance && make test_php_c)
+  # Run pure-PHP tests only.
+  pushd php
+  rm -rf vendor
+  composer update
+  composer test
+  popd
+  (cd conformance && make test_php)
 }
 
 build_php7.0() {
@@ -630,7 +511,7 @@ build_php7.0() {
   pushd php
   rm -rf vendor
   composer update
-  ./vendor/bin/phpunit
+  composer test
   popd
   (cd conformance && make test_php)
 }
@@ -655,6 +536,7 @@ build_php7.0_mixed() {
   rm -rf vendor
   composer update
   tests/compile_extension.sh
+  tests/generate_protos.sh
   php -dextension=./ext/google/protobuf/modules/protobuf.so ./vendor/bin/phpunit
   popd
 }
@@ -674,17 +556,12 @@ build_php7.0_zts_c() {
 }
 
 build_php7.0_mac() {
-  generate_php_test_proto
+  internal_build_cpp
   # Install PHP
   curl -s https://php-osx.liip.ch/install.sh | bash -s 7.0
   PHP_FOLDER=`find /usr/local -type d -name "php5-7.0*"`  # The folder name may change upon time
   test ! -z "$PHP_FOLDER"
   export PATH="$PHP_FOLDER/bin:$PATH"
-
-  # Install phpunit
-  curl https://phar.phpunit.de/phpunit-5.6.0.phar -L -o phpunit.phar
-  chmod +x phpunit.phar
-  sudo mv phpunit.phar /usr/local/bin/phpunit
 
   # Install valgrind
   echo "#! /bin/bash" > valgrind
@@ -697,7 +574,7 @@ build_php7.0_mac() {
 }
 
 build_php7.3_mac() {
-  generate_php_test_proto
+  internal_build_cpp
   # Install PHP
   # We can't test PHP 7.4 with these binaries yet:
   #   https://github.com/liip/php-osx/issues/276
@@ -705,11 +582,6 @@ build_php7.3_mac() {
   PHP_FOLDER=`find /usr/local -type d -name "php5-7.3*"`  # The folder name may change upon time
   test ! -z "$PHP_FOLDER"
   export PATH="$PHP_FOLDER/bin:$PATH"
-
-  # Install phpunit
-  curl https://phar.phpunit.de/phpunit-8.phar -L -o phpunit.phar
-  chmod +x phpunit.phar
-  sudo mv phpunit.phar /usr/local/bin/phpunit
 
   # Install valgrind
   echo "#! /bin/bash" > valgrind
@@ -736,7 +608,7 @@ build_php7.1() {
   pushd php
   rm -rf vendor
   composer update
-  ./vendor/bin/phpunit
+  composer test
   popd
   (cd conformance && make test_php)
 }
@@ -761,6 +633,7 @@ build_php7.1_mixed() {
   rm -rf vendor
   composer update
   tests/compile_extension.sh
+  tests/generate_protos.sh
   php -dextension=./ext/google/protobuf/modules/protobuf.so ./vendor/bin/phpunit
   popd
 }
@@ -784,7 +657,7 @@ build_php7.4() {
   pushd php
   rm -rf vendor
   composer update
-  ./vendor/bin/phpunit
+  composer test
   popd
   (cd conformance && make test_php)
 }
@@ -801,7 +674,6 @@ build_php7.4_c() {
     make test_php_c_32
   fi
   popd
-  (cd php/ext/google/protobuf && phpize --clean)
 }
 
 build_php7.4_mixed() {
@@ -810,9 +682,9 @@ build_php7.4_mixed() {
   rm -rf vendor
   composer update
   tests/compile_extension.sh
+  tests/generate_protos.sh
   php -dextension=./ext/google/protobuf/modules/protobuf.so ./vendor/bin/phpunit
   popd
-  (cd php/ext/google/protobuf && phpize --clean)
 }
 
 build_php7.4_zts_c() {
@@ -827,7 +699,6 @@ build_php7.4_zts_c() {
     make test_php_c_32
   fi
   popd
-  (cd php/ext/google/protobuf && phpize --clean)
 }
 
 build_php_all_32() {
@@ -836,18 +707,12 @@ build_php_all_32() {
   build_php7.0
   build_php7.1
   build_php7.4
-  build_php5.5_c $1
-  build_php5.6_c $1
   build_php7.0_c $1
   build_php7.1_c $1
   build_php7.4_c $1
-  build_php5.5_mixed
-  build_php5.6_mixed
   build_php7.0_mixed
   build_php7.1_mixed
   build_php7.4_mixed
-  build_php5.5_zts_c $1
-  build_php5.6_zts_c $1
   build_php7.0_zts_c $1
   build_php7.1_zts_c $1
   build_php7.4_zts_c $1
@@ -894,9 +759,7 @@ Usage: $0 { cpp |
             jruby |
             ruby_all |
             php5.5   |
-            php5.5_c |
             php5.6   |
-            php5.6_c |
             php7.0   |
             php7.0_c |
             php_compatibility |

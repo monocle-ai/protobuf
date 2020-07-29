@@ -1,11 +1,4 @@
 /* Amalgamated source file */
-
-// php.h intentionally defined NDEBUG. We have to define this macro in order to
-// be used together with php.h
-#ifndef NDEBUG
-#define NDEBUG
-#endif
-
 #include <stdint.h>/*
 * This is where we define macros used across upb.
 *
@@ -146,6 +139,8 @@ int msvc_vsnprintf(char* s, size_t n, const char* format, va_list arg);
 #ifdef NDEBUG
 #ifdef __GNUC__
 #define UPB_ASSUME(expr) if (!(expr)) __builtin_unreachable()
+#elif defined _MSC_VER
+#define UPB_ASSUME(expr) if (!(expr)) __assume(0)
 #else
 #define UPB_ASSUME(expr) do {} if (false && (expr))
 #endif
@@ -258,6 +253,7 @@ void upb_status_clear(upb_status *status);
 void upb_status_seterrmsg(upb_status *status, const char *msg);
 void upb_status_seterrf(upb_status *status, const char *fmt, ...);
 void upb_status_vseterrf(upb_status *status, const char *fmt, va_list args);
+void upb_status_vappenderrf(upb_status *status, const char *fmt, va_list args);
 
 /** upb_strview ************************************************************/
 
@@ -493,7 +489,7 @@ typedef enum {
   UPB_DTYPE_SINT64   = 18
 } upb_descriptortype_t;
 
-#define UPB_MAP_BEGIN -1
+#define UPB_MAP_BEGIN ((size_t)-1)
 
 
 #ifdef __cplusplus
@@ -975,10 +971,10 @@ enum {
 typedef struct {
   uint32_t number;
   uint16_t offset;
-  int16_t presence;      /* If >0, hasbit_index.  If <0, -oneof_index. */
+  int16_t presence;       /* If >0, hasbit_index.  If <0, ~oneof_index. */
   uint16_t submsg_index;  /* undefined if descriptortype != MESSAGE or GROUP. */
   uint8_t descriptortype;
-  uint8_t label;
+  uint8_t label;          /* google.protobuf.Label or _UPB_LABEL_* above. */
 } upb_msglayout_field;
 
 typedef struct upb_msglayout {
@@ -1016,6 +1012,12 @@ extern char _upb_fieldtype_to_size[12];
 /* Creates a new messages with the given layout on the given arena. */
 upb_msg *_upb_msg_new(const upb_msglayout *l, upb_arena *a);
 
+/* Clears the given message. */
+void _upb_msg_clear(upb_msg *msg, const upb_msglayout *l);
+
+/* Discards the unknown fields for this message only. */
+void _upb_msg_discardunknown_shallow(upb_msg *msg);
+
 /* Adds unknown data (serialized protobuf data) to the given message.  The data
  * is copied into the message instance. */
 bool _upb_msg_addunknown(upb_msg *msg, const char *data, size_t len,
@@ -1024,28 +1026,75 @@ bool _upb_msg_addunknown(upb_msg *msg, const char *data, size_t len,
 /* Returns a reference to the message's unknown data. */
 const char *upb_msg_getunknown(const upb_msg *msg, size_t *len);
 
-UPB_INLINE bool _upb_has_field(const void *msg, size_t idx) {
+/** Hasbit access *************************************************************/
+
+UPB_INLINE bool _upb_hasbit(const upb_msg *msg, size_t idx) {
   return (*PTR_AT(msg, idx / 8, const char) & (1 << (idx % 8))) != 0;
 }
 
-UPB_INLINE bool _upb_sethas(const void *msg, size_t idx) {
-  return (*PTR_AT(msg, idx / 8, char)) |= (char)(1 << (idx % 8));
+UPB_INLINE void _upb_sethas(const upb_msg *msg, size_t idx) {
+  (*PTR_AT(msg, idx / 8, char)) |= (char)(1 << (idx % 8));
 }
 
-UPB_INLINE bool _upb_clearhas(const void *msg, size_t idx) {
-  return (*PTR_AT(msg, idx / 8, char)) &= (char)(~(1 << (idx % 8)));
+UPB_INLINE void _upb_clearhas(const upb_msg *msg, size_t idx) {
+  (*PTR_AT(msg, idx / 8, char)) &= (char)(~(1 << (idx % 8)));
 }
 
-UPB_INLINE bool _upb_has_oneof_field(const void *msg, size_t case_ofs, int32_t num) {
-  return *PTR_AT(msg, case_ofs, int32_t) == num;
+UPB_INLINE size_t _upb_msg_hasidx(const upb_msglayout_field *f) {
+  UPB_ASSERT(f->presence > 0);
+  return f->presence;
 }
 
-UPB_INLINE bool _upb_has_submsg_nohasbit(const void *msg, size_t ofs) {
-  return *PTR_AT(msg, ofs, const void*) != NULL;
+UPB_INLINE bool _upb_hasbit_field(const upb_msg *msg,
+                                  const upb_msglayout_field *f) {
+  return _upb_hasbit(msg, _upb_msg_hasidx(f));
+}
+
+UPB_INLINE void _upb_sethas_field(const upb_msg *msg,
+                                  const upb_msglayout_field *f) {
+  _upb_sethas(msg, _upb_msg_hasidx(f));
+}
+
+UPB_INLINE void _upb_clearhas_field(const upb_msg *msg,
+                                    const upb_msglayout_field *f) {
+  _upb_clearhas(msg, _upb_msg_hasidx(f));
+}
+
+/** Oneof case access *********************************************************/
+
+UPB_INLINE uint32_t *_upb_oneofcase(upb_msg *msg, size_t case_ofs) {
+  return PTR_AT(msg, case_ofs, uint32_t);
+}
+
+UPB_INLINE uint32_t _upb_getoneofcase(const void *msg, size_t case_ofs) {
+  return *PTR_AT(msg, case_ofs, uint32_t);
+}
+
+UPB_INLINE size_t _upb_oneofcase_ofs(const upb_msglayout_field *f) {
+  UPB_ASSERT(f->presence < 0);
+  return ~(int64_t)f->presence;
+}
+
+UPB_INLINE uint32_t *_upb_oneofcase_field(upb_msg *msg,
+                                          const upb_msglayout_field *f) {
+  return _upb_oneofcase(msg, _upb_oneofcase_ofs(f));
+}
+
+UPB_INLINE uint32_t _upb_getoneofcase_field(const upb_msg *msg,
+                                            const upb_msglayout_field *f) {
+  return _upb_getoneofcase(msg, _upb_oneofcase_ofs(f));
+}
+
+UPB_INLINE bool _upb_has_submsg_nohasbit(const upb_msg *msg, size_t ofs) {
+  return *PTR_AT(msg, ofs, const upb_msg*) != NULL;
 }
 
 UPB_INLINE bool _upb_isrepeated(const upb_msglayout_field *field) {
   return (field->label & 3) == UPB_LABEL_REPEATED;
+}
+
+UPB_INLINE bool _upb_repeated_or_map(const upb_msglayout_field *field) {
+  return field->label >= UPB_LABEL_REPEATED;
 }
 
 /** upb_array *****************************************************************/
@@ -1076,6 +1125,19 @@ void *_upb_array_resize_fallback(upb_array **arr_ptr, size_t size,
                                  upb_fieldtype_t type, upb_arena *arena);
 bool _upb_array_append_fallback(upb_array **arr_ptr, const void *value,
                                 upb_fieldtype_t type, upb_arena *arena);
+
+UPB_INLINE bool _upb_array_reserve(upb_array *arr, size_t size,
+                                   upb_arena *arena) {
+  if (arr->size < size) return _upb_array_realloc(arr, size, arena);
+  return true;
+}
+
+UPB_INLINE bool _upb_array_resize(upb_array *arr, size_t size,
+                                  upb_arena *arena) {
+  if (!_upb_array_reserve(arr, size, arena)) return false;
+  arr->len = size;
+  return true;
+}
 
 UPB_INLINE const void *_upb_array_accessor(const void *msg, size_t ofs,
                                            size_t *size) {
@@ -1220,7 +1282,7 @@ UPB_INLINE bool _upb_map_get(const upb_map *map, const void *key,
   upb_value tabval;
   upb_strview k = _upb_map_tokey(key, key_size);
   bool ret = upb_strtable_lookup2(&map->table, k.data, k.size, &tabval);
-  if (ret) {
+  if (ret && val) {
     _upb_map_fromvalue(tabval, val, val_size);
   }
   return ret;
@@ -1231,8 +1293,8 @@ UPB_INLINE void* _upb_map_next(const upb_map *map, size_t *iter) {
   it.t = &map->table;
   it.index = *iter;
   upb_strtable_next(&it);
-  if (upb_strtable_done(&it)) return NULL;
   *iter = it.index;
+  if (upb_strtable_done(&it)) return NULL;
   return (void*)str_tabent(&it);
 }
 
@@ -1568,9 +1630,9 @@ UPB_INLINE char *google_protobuf_FileDescriptorProto_serialize(const google_prot
   return upb_encode(msg, &google_protobuf_FileDescriptorProto_msginit, arena, len);
 }
 
-UPB_INLINE bool google_protobuf_FileDescriptorProto_has_name(const google_protobuf_FileDescriptorProto *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_FileDescriptorProto_has_name(const google_protobuf_FileDescriptorProto *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE upb_strview google_protobuf_FileDescriptorProto_name(const google_protobuf_FileDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(4, 8), upb_strview); }
-UPB_INLINE bool google_protobuf_FileDescriptorProto_has_package(const google_protobuf_FileDescriptorProto *msg) { return _upb_has_field(msg, 2); }
+UPB_INLINE bool google_protobuf_FileDescriptorProto_has_package(const google_protobuf_FileDescriptorProto *msg) { return _upb_hasbit(msg, 2); }
 UPB_INLINE upb_strview google_protobuf_FileDescriptorProto_package(const google_protobuf_FileDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(12, 24), upb_strview); }
 UPB_INLINE upb_strview const* google_protobuf_FileDescriptorProto_dependency(const google_protobuf_FileDescriptorProto *msg, size_t *len) { return (upb_strview const*)_upb_array_accessor(msg, UPB_SIZE(36, 72), len); }
 UPB_INLINE bool google_protobuf_FileDescriptorProto_has_message_type(const google_protobuf_FileDescriptorProto *msg) { return _upb_has_submsg_nohasbit(msg, UPB_SIZE(40, 80)); }
@@ -1581,13 +1643,13 @@ UPB_INLINE bool google_protobuf_FileDescriptorProto_has_service(const google_pro
 UPB_INLINE const google_protobuf_ServiceDescriptorProto* const* google_protobuf_FileDescriptorProto_service(const google_protobuf_FileDescriptorProto *msg, size_t *len) { return (const google_protobuf_ServiceDescriptorProto* const*)_upb_array_accessor(msg, UPB_SIZE(48, 96), len); }
 UPB_INLINE bool google_protobuf_FileDescriptorProto_has_extension(const google_protobuf_FileDescriptorProto *msg) { return _upb_has_submsg_nohasbit(msg, UPB_SIZE(52, 104)); }
 UPB_INLINE const google_protobuf_FieldDescriptorProto* const* google_protobuf_FileDescriptorProto_extension(const google_protobuf_FileDescriptorProto *msg, size_t *len) { return (const google_protobuf_FieldDescriptorProto* const*)_upb_array_accessor(msg, UPB_SIZE(52, 104), len); }
-UPB_INLINE bool google_protobuf_FileDescriptorProto_has_options(const google_protobuf_FileDescriptorProto *msg) { return _upb_has_field(msg, 4); }
+UPB_INLINE bool google_protobuf_FileDescriptorProto_has_options(const google_protobuf_FileDescriptorProto *msg) { return _upb_hasbit(msg, 4); }
 UPB_INLINE const google_protobuf_FileOptions* google_protobuf_FileDescriptorProto_options(const google_protobuf_FileDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(28, 56), const google_protobuf_FileOptions*); }
-UPB_INLINE bool google_protobuf_FileDescriptorProto_has_source_code_info(const google_protobuf_FileDescriptorProto *msg) { return _upb_has_field(msg, 5); }
+UPB_INLINE bool google_protobuf_FileDescriptorProto_has_source_code_info(const google_protobuf_FileDescriptorProto *msg) { return _upb_hasbit(msg, 5); }
 UPB_INLINE const google_protobuf_SourceCodeInfo* google_protobuf_FileDescriptorProto_source_code_info(const google_protobuf_FileDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(32, 64), const google_protobuf_SourceCodeInfo*); }
 UPB_INLINE int32_t const* google_protobuf_FileDescriptorProto_public_dependency(const google_protobuf_FileDescriptorProto *msg, size_t *len) { return (int32_t const*)_upb_array_accessor(msg, UPB_SIZE(56, 112), len); }
 UPB_INLINE int32_t const* google_protobuf_FileDescriptorProto_weak_dependency(const google_protobuf_FileDescriptorProto *msg, size_t *len) { return (int32_t const*)_upb_array_accessor(msg, UPB_SIZE(60, 120), len); }
-UPB_INLINE bool google_protobuf_FileDescriptorProto_has_syntax(const google_protobuf_FileDescriptorProto *msg) { return _upb_has_field(msg, 3); }
+UPB_INLINE bool google_protobuf_FileDescriptorProto_has_syntax(const google_protobuf_FileDescriptorProto *msg) { return _upb_hasbit(msg, 3); }
 UPB_INLINE upb_strview google_protobuf_FileDescriptorProto_syntax(const google_protobuf_FileDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(20, 40), upb_strview); }
 
 UPB_INLINE void google_protobuf_FileDescriptorProto_set_name(google_protobuf_FileDescriptorProto *msg, upb_strview value) {
@@ -1725,7 +1787,7 @@ UPB_INLINE char *google_protobuf_DescriptorProto_serialize(const google_protobuf
   return upb_encode(msg, &google_protobuf_DescriptorProto_msginit, arena, len);
 }
 
-UPB_INLINE bool google_protobuf_DescriptorProto_has_name(const google_protobuf_DescriptorProto *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_DescriptorProto_has_name(const google_protobuf_DescriptorProto *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE upb_strview google_protobuf_DescriptorProto_name(const google_protobuf_DescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(4, 8), upb_strview); }
 UPB_INLINE bool google_protobuf_DescriptorProto_has_field(const google_protobuf_DescriptorProto *msg) { return _upb_has_submsg_nohasbit(msg, UPB_SIZE(16, 32)); }
 UPB_INLINE const google_protobuf_FieldDescriptorProto* const* google_protobuf_DescriptorProto_field(const google_protobuf_DescriptorProto *msg, size_t *len) { return (const google_protobuf_FieldDescriptorProto* const*)_upb_array_accessor(msg, UPB_SIZE(16, 32), len); }
@@ -1737,7 +1799,7 @@ UPB_INLINE bool google_protobuf_DescriptorProto_has_extension_range(const google
 UPB_INLINE const google_protobuf_DescriptorProto_ExtensionRange* const* google_protobuf_DescriptorProto_extension_range(const google_protobuf_DescriptorProto *msg, size_t *len) { return (const google_protobuf_DescriptorProto_ExtensionRange* const*)_upb_array_accessor(msg, UPB_SIZE(28, 56), len); }
 UPB_INLINE bool google_protobuf_DescriptorProto_has_extension(const google_protobuf_DescriptorProto *msg) { return _upb_has_submsg_nohasbit(msg, UPB_SIZE(32, 64)); }
 UPB_INLINE const google_protobuf_FieldDescriptorProto* const* google_protobuf_DescriptorProto_extension(const google_protobuf_DescriptorProto *msg, size_t *len) { return (const google_protobuf_FieldDescriptorProto* const*)_upb_array_accessor(msg, UPB_SIZE(32, 64), len); }
-UPB_INLINE bool google_protobuf_DescriptorProto_has_options(const google_protobuf_DescriptorProto *msg) { return _upb_has_field(msg, 2); }
+UPB_INLINE bool google_protobuf_DescriptorProto_has_options(const google_protobuf_DescriptorProto *msg) { return _upb_hasbit(msg, 2); }
 UPB_INLINE const google_protobuf_MessageOptions* google_protobuf_DescriptorProto_options(const google_protobuf_DescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(12, 24), const google_protobuf_MessageOptions*); }
 UPB_INLINE bool google_protobuf_DescriptorProto_has_oneof_decl(const google_protobuf_DescriptorProto *msg) { return _upb_has_submsg_nohasbit(msg, UPB_SIZE(36, 72)); }
 UPB_INLINE const google_protobuf_OneofDescriptorProto* const* google_protobuf_DescriptorProto_oneof_decl(const google_protobuf_DescriptorProto *msg, size_t *len) { return (const google_protobuf_OneofDescriptorProto* const*)_upb_array_accessor(msg, UPB_SIZE(36, 72), len); }
@@ -1878,11 +1940,11 @@ UPB_INLINE char *google_protobuf_DescriptorProto_ExtensionRange_serialize(const 
   return upb_encode(msg, &google_protobuf_DescriptorProto_ExtensionRange_msginit, arena, len);
 }
 
-UPB_INLINE bool google_protobuf_DescriptorProto_ExtensionRange_has_start(const google_protobuf_DescriptorProto_ExtensionRange *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_DescriptorProto_ExtensionRange_has_start(const google_protobuf_DescriptorProto_ExtensionRange *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE int32_t google_protobuf_DescriptorProto_ExtensionRange_start(const google_protobuf_DescriptorProto_ExtensionRange *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(4, 4), int32_t); }
-UPB_INLINE bool google_protobuf_DescriptorProto_ExtensionRange_has_end(const google_protobuf_DescriptorProto_ExtensionRange *msg) { return _upb_has_field(msg, 2); }
+UPB_INLINE bool google_protobuf_DescriptorProto_ExtensionRange_has_end(const google_protobuf_DescriptorProto_ExtensionRange *msg) { return _upb_hasbit(msg, 2); }
 UPB_INLINE int32_t google_protobuf_DescriptorProto_ExtensionRange_end(const google_protobuf_DescriptorProto_ExtensionRange *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(8, 8), int32_t); }
-UPB_INLINE bool google_protobuf_DescriptorProto_ExtensionRange_has_options(const google_protobuf_DescriptorProto_ExtensionRange *msg) { return _upb_has_field(msg, 3); }
+UPB_INLINE bool google_protobuf_DescriptorProto_ExtensionRange_has_options(const google_protobuf_DescriptorProto_ExtensionRange *msg) { return _upb_hasbit(msg, 3); }
 UPB_INLINE const google_protobuf_ExtensionRangeOptions* google_protobuf_DescriptorProto_ExtensionRange_options(const google_protobuf_DescriptorProto_ExtensionRange *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(12, 16), const google_protobuf_ExtensionRangeOptions*); }
 
 UPB_INLINE void google_protobuf_DescriptorProto_ExtensionRange_set_start(google_protobuf_DescriptorProto_ExtensionRange *msg, int32_t value) {
@@ -1921,9 +1983,9 @@ UPB_INLINE char *google_protobuf_DescriptorProto_ReservedRange_serialize(const g
   return upb_encode(msg, &google_protobuf_DescriptorProto_ReservedRange_msginit, arena, len);
 }
 
-UPB_INLINE bool google_protobuf_DescriptorProto_ReservedRange_has_start(const google_protobuf_DescriptorProto_ReservedRange *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_DescriptorProto_ReservedRange_has_start(const google_protobuf_DescriptorProto_ReservedRange *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE int32_t google_protobuf_DescriptorProto_ReservedRange_start(const google_protobuf_DescriptorProto_ReservedRange *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(4, 4), int32_t); }
-UPB_INLINE bool google_protobuf_DescriptorProto_ReservedRange_has_end(const google_protobuf_DescriptorProto_ReservedRange *msg) { return _upb_has_field(msg, 2); }
+UPB_INLINE bool google_protobuf_DescriptorProto_ReservedRange_has_end(const google_protobuf_DescriptorProto_ReservedRange *msg) { return _upb_hasbit(msg, 2); }
 UPB_INLINE int32_t google_protobuf_DescriptorProto_ReservedRange_end(const google_protobuf_DescriptorProto_ReservedRange *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(8, 8), int32_t); }
 
 UPB_INLINE void google_protobuf_DescriptorProto_ReservedRange_set_start(google_protobuf_DescriptorProto_ReservedRange *msg, int32_t value) {
@@ -1980,27 +2042,27 @@ UPB_INLINE char *google_protobuf_FieldDescriptorProto_serialize(const google_pro
   return upb_encode(msg, &google_protobuf_FieldDescriptorProto_msginit, arena, len);
 }
 
-UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_name(const google_protobuf_FieldDescriptorProto *msg) { return _upb_has_field(msg, 6); }
+UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_name(const google_protobuf_FieldDescriptorProto *msg) { return _upb_hasbit(msg, 6); }
 UPB_INLINE upb_strview google_protobuf_FieldDescriptorProto_name(const google_protobuf_FieldDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(36, 40), upb_strview); }
-UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_extendee(const google_protobuf_FieldDescriptorProto *msg) { return _upb_has_field(msg, 7); }
+UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_extendee(const google_protobuf_FieldDescriptorProto *msg) { return _upb_hasbit(msg, 7); }
 UPB_INLINE upb_strview google_protobuf_FieldDescriptorProto_extendee(const google_protobuf_FieldDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(44, 56), upb_strview); }
-UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_number(const google_protobuf_FieldDescriptorProto *msg) { return _upb_has_field(msg, 3); }
+UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_number(const google_protobuf_FieldDescriptorProto *msg) { return _upb_hasbit(msg, 3); }
 UPB_INLINE int32_t google_protobuf_FieldDescriptorProto_number(const google_protobuf_FieldDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(24, 24), int32_t); }
-UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_label(const google_protobuf_FieldDescriptorProto *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_label(const google_protobuf_FieldDescriptorProto *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE int32_t google_protobuf_FieldDescriptorProto_label(const google_protobuf_FieldDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(8, 8), int32_t); }
-UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_type(const google_protobuf_FieldDescriptorProto *msg) { return _upb_has_field(msg, 2); }
+UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_type(const google_protobuf_FieldDescriptorProto *msg) { return _upb_hasbit(msg, 2); }
 UPB_INLINE int32_t google_protobuf_FieldDescriptorProto_type(const google_protobuf_FieldDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(16, 16), int32_t); }
-UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_type_name(const google_protobuf_FieldDescriptorProto *msg) { return _upb_has_field(msg, 8); }
+UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_type_name(const google_protobuf_FieldDescriptorProto *msg) { return _upb_hasbit(msg, 8); }
 UPB_INLINE upb_strview google_protobuf_FieldDescriptorProto_type_name(const google_protobuf_FieldDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(52, 72), upb_strview); }
-UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_default_value(const google_protobuf_FieldDescriptorProto *msg) { return _upb_has_field(msg, 9); }
+UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_default_value(const google_protobuf_FieldDescriptorProto *msg) { return _upb_hasbit(msg, 9); }
 UPB_INLINE upb_strview google_protobuf_FieldDescriptorProto_default_value(const google_protobuf_FieldDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(60, 88), upb_strview); }
-UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_options(const google_protobuf_FieldDescriptorProto *msg) { return _upb_has_field(msg, 11); }
+UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_options(const google_protobuf_FieldDescriptorProto *msg) { return _upb_hasbit(msg, 11); }
 UPB_INLINE const google_protobuf_FieldOptions* google_protobuf_FieldDescriptorProto_options(const google_protobuf_FieldDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(76, 120), const google_protobuf_FieldOptions*); }
-UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_oneof_index(const google_protobuf_FieldDescriptorProto *msg) { return _upb_has_field(msg, 4); }
+UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_oneof_index(const google_protobuf_FieldDescriptorProto *msg) { return _upb_hasbit(msg, 4); }
 UPB_INLINE int32_t google_protobuf_FieldDescriptorProto_oneof_index(const google_protobuf_FieldDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(28, 28), int32_t); }
-UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_json_name(const google_protobuf_FieldDescriptorProto *msg) { return _upb_has_field(msg, 10); }
+UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_json_name(const google_protobuf_FieldDescriptorProto *msg) { return _upb_hasbit(msg, 10); }
 UPB_INLINE upb_strview google_protobuf_FieldDescriptorProto_json_name(const google_protobuf_FieldDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(68, 104), upb_strview); }
-UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_proto3_optional(const google_protobuf_FieldDescriptorProto *msg) { return _upb_has_field(msg, 5); }
+UPB_INLINE bool google_protobuf_FieldDescriptorProto_has_proto3_optional(const google_protobuf_FieldDescriptorProto *msg) { return _upb_hasbit(msg, 5); }
 UPB_INLINE bool google_protobuf_FieldDescriptorProto_proto3_optional(const google_protobuf_FieldDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(32, 32), bool); }
 
 UPB_INLINE void google_protobuf_FieldDescriptorProto_set_name(google_protobuf_FieldDescriptorProto *msg, upb_strview value) {
@@ -2071,9 +2133,9 @@ UPB_INLINE char *google_protobuf_OneofDescriptorProto_serialize(const google_pro
   return upb_encode(msg, &google_protobuf_OneofDescriptorProto_msginit, arena, len);
 }
 
-UPB_INLINE bool google_protobuf_OneofDescriptorProto_has_name(const google_protobuf_OneofDescriptorProto *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_OneofDescriptorProto_has_name(const google_protobuf_OneofDescriptorProto *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE upb_strview google_protobuf_OneofDescriptorProto_name(const google_protobuf_OneofDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(4, 8), upb_strview); }
-UPB_INLINE bool google_protobuf_OneofDescriptorProto_has_options(const google_protobuf_OneofDescriptorProto *msg) { return _upb_has_field(msg, 2); }
+UPB_INLINE bool google_protobuf_OneofDescriptorProto_has_options(const google_protobuf_OneofDescriptorProto *msg) { return _upb_hasbit(msg, 2); }
 UPB_INLINE const google_protobuf_OneofOptions* google_protobuf_OneofDescriptorProto_options(const google_protobuf_OneofDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(12, 24), const google_protobuf_OneofOptions*); }
 
 UPB_INLINE void google_protobuf_OneofDescriptorProto_set_name(google_protobuf_OneofDescriptorProto *msg, upb_strview value) {
@@ -2108,11 +2170,11 @@ UPB_INLINE char *google_protobuf_EnumDescriptorProto_serialize(const google_prot
   return upb_encode(msg, &google_protobuf_EnumDescriptorProto_msginit, arena, len);
 }
 
-UPB_INLINE bool google_protobuf_EnumDescriptorProto_has_name(const google_protobuf_EnumDescriptorProto *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_EnumDescriptorProto_has_name(const google_protobuf_EnumDescriptorProto *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE upb_strview google_protobuf_EnumDescriptorProto_name(const google_protobuf_EnumDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(4, 8), upb_strview); }
 UPB_INLINE bool google_protobuf_EnumDescriptorProto_has_value(const google_protobuf_EnumDescriptorProto *msg) { return _upb_has_submsg_nohasbit(msg, UPB_SIZE(16, 32)); }
 UPB_INLINE const google_protobuf_EnumValueDescriptorProto* const* google_protobuf_EnumDescriptorProto_value(const google_protobuf_EnumDescriptorProto *msg, size_t *len) { return (const google_protobuf_EnumValueDescriptorProto* const*)_upb_array_accessor(msg, UPB_SIZE(16, 32), len); }
-UPB_INLINE bool google_protobuf_EnumDescriptorProto_has_options(const google_protobuf_EnumDescriptorProto *msg) { return _upb_has_field(msg, 2); }
+UPB_INLINE bool google_protobuf_EnumDescriptorProto_has_options(const google_protobuf_EnumDescriptorProto *msg) { return _upb_hasbit(msg, 2); }
 UPB_INLINE const google_protobuf_EnumOptions* google_protobuf_EnumDescriptorProto_options(const google_protobuf_EnumDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(12, 24), const google_protobuf_EnumOptions*); }
 UPB_INLINE bool google_protobuf_EnumDescriptorProto_has_reserved_range(const google_protobuf_EnumDescriptorProto *msg) { return _upb_has_submsg_nohasbit(msg, UPB_SIZE(20, 40)); }
 UPB_INLINE const google_protobuf_EnumDescriptorProto_EnumReservedRange* const* google_protobuf_EnumDescriptorProto_reserved_range(const google_protobuf_EnumDescriptorProto *msg, size_t *len) { return (const google_protobuf_EnumDescriptorProto_EnumReservedRange* const*)_upb_array_accessor(msg, UPB_SIZE(20, 40), len); }
@@ -2186,9 +2248,9 @@ UPB_INLINE char *google_protobuf_EnumDescriptorProto_EnumReservedRange_serialize
   return upb_encode(msg, &google_protobuf_EnumDescriptorProto_EnumReservedRange_msginit, arena, len);
 }
 
-UPB_INLINE bool google_protobuf_EnumDescriptorProto_EnumReservedRange_has_start(const google_protobuf_EnumDescriptorProto_EnumReservedRange *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_EnumDescriptorProto_EnumReservedRange_has_start(const google_protobuf_EnumDescriptorProto_EnumReservedRange *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE int32_t google_protobuf_EnumDescriptorProto_EnumReservedRange_start(const google_protobuf_EnumDescriptorProto_EnumReservedRange *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(4, 4), int32_t); }
-UPB_INLINE bool google_protobuf_EnumDescriptorProto_EnumReservedRange_has_end(const google_protobuf_EnumDescriptorProto_EnumReservedRange *msg) { return _upb_has_field(msg, 2); }
+UPB_INLINE bool google_protobuf_EnumDescriptorProto_EnumReservedRange_has_end(const google_protobuf_EnumDescriptorProto_EnumReservedRange *msg) { return _upb_hasbit(msg, 2); }
 UPB_INLINE int32_t google_protobuf_EnumDescriptorProto_EnumReservedRange_end(const google_protobuf_EnumDescriptorProto_EnumReservedRange *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(8, 8), int32_t); }
 
 UPB_INLINE void google_protobuf_EnumDescriptorProto_EnumReservedRange_set_start(google_protobuf_EnumDescriptorProto_EnumReservedRange *msg, int32_t value) {
@@ -2214,11 +2276,11 @@ UPB_INLINE char *google_protobuf_EnumValueDescriptorProto_serialize(const google
   return upb_encode(msg, &google_protobuf_EnumValueDescriptorProto_msginit, arena, len);
 }
 
-UPB_INLINE bool google_protobuf_EnumValueDescriptorProto_has_name(const google_protobuf_EnumValueDescriptorProto *msg) { return _upb_has_field(msg, 2); }
+UPB_INLINE bool google_protobuf_EnumValueDescriptorProto_has_name(const google_protobuf_EnumValueDescriptorProto *msg) { return _upb_hasbit(msg, 2); }
 UPB_INLINE upb_strview google_protobuf_EnumValueDescriptorProto_name(const google_protobuf_EnumValueDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(8, 8), upb_strview); }
-UPB_INLINE bool google_protobuf_EnumValueDescriptorProto_has_number(const google_protobuf_EnumValueDescriptorProto *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_EnumValueDescriptorProto_has_number(const google_protobuf_EnumValueDescriptorProto *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE int32_t google_protobuf_EnumValueDescriptorProto_number(const google_protobuf_EnumValueDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(4, 4), int32_t); }
-UPB_INLINE bool google_protobuf_EnumValueDescriptorProto_has_options(const google_protobuf_EnumValueDescriptorProto *msg) { return _upb_has_field(msg, 3); }
+UPB_INLINE bool google_protobuf_EnumValueDescriptorProto_has_options(const google_protobuf_EnumValueDescriptorProto *msg) { return _upb_hasbit(msg, 3); }
 UPB_INLINE const google_protobuf_EnumValueOptions* google_protobuf_EnumValueDescriptorProto_options(const google_protobuf_EnumValueDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(16, 24), const google_protobuf_EnumValueOptions*); }
 
 UPB_INLINE void google_protobuf_EnumValueDescriptorProto_set_name(google_protobuf_EnumValueDescriptorProto *msg, upb_strview value) {
@@ -2257,11 +2319,11 @@ UPB_INLINE char *google_protobuf_ServiceDescriptorProto_serialize(const google_p
   return upb_encode(msg, &google_protobuf_ServiceDescriptorProto_msginit, arena, len);
 }
 
-UPB_INLINE bool google_protobuf_ServiceDescriptorProto_has_name(const google_protobuf_ServiceDescriptorProto *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_ServiceDescriptorProto_has_name(const google_protobuf_ServiceDescriptorProto *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE upb_strview google_protobuf_ServiceDescriptorProto_name(const google_protobuf_ServiceDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(4, 8), upb_strview); }
 UPB_INLINE bool google_protobuf_ServiceDescriptorProto_has_method(const google_protobuf_ServiceDescriptorProto *msg) { return _upb_has_submsg_nohasbit(msg, UPB_SIZE(16, 32)); }
 UPB_INLINE const google_protobuf_MethodDescriptorProto* const* google_protobuf_ServiceDescriptorProto_method(const google_protobuf_ServiceDescriptorProto *msg, size_t *len) { return (const google_protobuf_MethodDescriptorProto* const*)_upb_array_accessor(msg, UPB_SIZE(16, 32), len); }
-UPB_INLINE bool google_protobuf_ServiceDescriptorProto_has_options(const google_protobuf_ServiceDescriptorProto *msg) { return _upb_has_field(msg, 2); }
+UPB_INLINE bool google_protobuf_ServiceDescriptorProto_has_options(const google_protobuf_ServiceDescriptorProto *msg) { return _upb_hasbit(msg, 2); }
 UPB_INLINE const google_protobuf_ServiceOptions* google_protobuf_ServiceDescriptorProto_options(const google_protobuf_ServiceDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(12, 24), const google_protobuf_ServiceOptions*); }
 
 UPB_INLINE void google_protobuf_ServiceDescriptorProto_set_name(google_protobuf_ServiceDescriptorProto *msg, upb_strview value) {
@@ -2309,17 +2371,17 @@ UPB_INLINE char *google_protobuf_MethodDescriptorProto_serialize(const google_pr
   return upb_encode(msg, &google_protobuf_MethodDescriptorProto_msginit, arena, len);
 }
 
-UPB_INLINE bool google_protobuf_MethodDescriptorProto_has_name(const google_protobuf_MethodDescriptorProto *msg) { return _upb_has_field(msg, 3); }
+UPB_INLINE bool google_protobuf_MethodDescriptorProto_has_name(const google_protobuf_MethodDescriptorProto *msg) { return _upb_hasbit(msg, 3); }
 UPB_INLINE upb_strview google_protobuf_MethodDescriptorProto_name(const google_protobuf_MethodDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(4, 8), upb_strview); }
-UPB_INLINE bool google_protobuf_MethodDescriptorProto_has_input_type(const google_protobuf_MethodDescriptorProto *msg) { return _upb_has_field(msg, 4); }
+UPB_INLINE bool google_protobuf_MethodDescriptorProto_has_input_type(const google_protobuf_MethodDescriptorProto *msg) { return _upb_hasbit(msg, 4); }
 UPB_INLINE upb_strview google_protobuf_MethodDescriptorProto_input_type(const google_protobuf_MethodDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(12, 24), upb_strview); }
-UPB_INLINE bool google_protobuf_MethodDescriptorProto_has_output_type(const google_protobuf_MethodDescriptorProto *msg) { return _upb_has_field(msg, 5); }
+UPB_INLINE bool google_protobuf_MethodDescriptorProto_has_output_type(const google_protobuf_MethodDescriptorProto *msg) { return _upb_hasbit(msg, 5); }
 UPB_INLINE upb_strview google_protobuf_MethodDescriptorProto_output_type(const google_protobuf_MethodDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(20, 40), upb_strview); }
-UPB_INLINE bool google_protobuf_MethodDescriptorProto_has_options(const google_protobuf_MethodDescriptorProto *msg) { return _upb_has_field(msg, 6); }
+UPB_INLINE bool google_protobuf_MethodDescriptorProto_has_options(const google_protobuf_MethodDescriptorProto *msg) { return _upb_hasbit(msg, 6); }
 UPB_INLINE const google_protobuf_MethodOptions* google_protobuf_MethodDescriptorProto_options(const google_protobuf_MethodDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(28, 56), const google_protobuf_MethodOptions*); }
-UPB_INLINE bool google_protobuf_MethodDescriptorProto_has_client_streaming(const google_protobuf_MethodDescriptorProto *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_MethodDescriptorProto_has_client_streaming(const google_protobuf_MethodDescriptorProto *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE bool google_protobuf_MethodDescriptorProto_client_streaming(const google_protobuf_MethodDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(1, 1), bool); }
-UPB_INLINE bool google_protobuf_MethodDescriptorProto_has_server_streaming(const google_protobuf_MethodDescriptorProto *msg) { return _upb_has_field(msg, 2); }
+UPB_INLINE bool google_protobuf_MethodDescriptorProto_has_server_streaming(const google_protobuf_MethodDescriptorProto *msg) { return _upb_hasbit(msg, 2); }
 UPB_INLINE bool google_protobuf_MethodDescriptorProto_server_streaming(const google_protobuf_MethodDescriptorProto *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(2, 2), bool); }
 
 UPB_INLINE void google_protobuf_MethodDescriptorProto_set_name(google_protobuf_MethodDescriptorProto *msg, upb_strview value) {
@@ -2370,45 +2432,45 @@ UPB_INLINE char *google_protobuf_FileOptions_serialize(const google_protobuf_Fil
   return upb_encode(msg, &google_protobuf_FileOptions_msginit, arena, len);
 }
 
-UPB_INLINE bool google_protobuf_FileOptions_has_java_package(const google_protobuf_FileOptions *msg) { return _upb_has_field(msg, 11); }
+UPB_INLINE bool google_protobuf_FileOptions_has_java_package(const google_protobuf_FileOptions *msg) { return _upb_hasbit(msg, 11); }
 UPB_INLINE upb_strview google_protobuf_FileOptions_java_package(const google_protobuf_FileOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(28, 32), upb_strview); }
-UPB_INLINE bool google_protobuf_FileOptions_has_java_outer_classname(const google_protobuf_FileOptions *msg) { return _upb_has_field(msg, 12); }
+UPB_INLINE bool google_protobuf_FileOptions_has_java_outer_classname(const google_protobuf_FileOptions *msg) { return _upb_hasbit(msg, 12); }
 UPB_INLINE upb_strview google_protobuf_FileOptions_java_outer_classname(const google_protobuf_FileOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(36, 48), upb_strview); }
-UPB_INLINE bool google_protobuf_FileOptions_has_optimize_for(const google_protobuf_FileOptions *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_FileOptions_has_optimize_for(const google_protobuf_FileOptions *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE int32_t google_protobuf_FileOptions_optimize_for(const google_protobuf_FileOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(8, 8), int32_t); }
-UPB_INLINE bool google_protobuf_FileOptions_has_java_multiple_files(const google_protobuf_FileOptions *msg) { return _upb_has_field(msg, 2); }
+UPB_INLINE bool google_protobuf_FileOptions_has_java_multiple_files(const google_protobuf_FileOptions *msg) { return _upb_hasbit(msg, 2); }
 UPB_INLINE bool google_protobuf_FileOptions_java_multiple_files(const google_protobuf_FileOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(16, 16), bool); }
-UPB_INLINE bool google_protobuf_FileOptions_has_go_package(const google_protobuf_FileOptions *msg) { return _upb_has_field(msg, 13); }
+UPB_INLINE bool google_protobuf_FileOptions_has_go_package(const google_protobuf_FileOptions *msg) { return _upb_hasbit(msg, 13); }
 UPB_INLINE upb_strview google_protobuf_FileOptions_go_package(const google_protobuf_FileOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(44, 64), upb_strview); }
-UPB_INLINE bool google_protobuf_FileOptions_has_cc_generic_services(const google_protobuf_FileOptions *msg) { return _upb_has_field(msg, 3); }
+UPB_INLINE bool google_protobuf_FileOptions_has_cc_generic_services(const google_protobuf_FileOptions *msg) { return _upb_hasbit(msg, 3); }
 UPB_INLINE bool google_protobuf_FileOptions_cc_generic_services(const google_protobuf_FileOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(17, 17), bool); }
-UPB_INLINE bool google_protobuf_FileOptions_has_java_generic_services(const google_protobuf_FileOptions *msg) { return _upb_has_field(msg, 4); }
+UPB_INLINE bool google_protobuf_FileOptions_has_java_generic_services(const google_protobuf_FileOptions *msg) { return _upb_hasbit(msg, 4); }
 UPB_INLINE bool google_protobuf_FileOptions_java_generic_services(const google_protobuf_FileOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(18, 18), bool); }
-UPB_INLINE bool google_protobuf_FileOptions_has_py_generic_services(const google_protobuf_FileOptions *msg) { return _upb_has_field(msg, 5); }
+UPB_INLINE bool google_protobuf_FileOptions_has_py_generic_services(const google_protobuf_FileOptions *msg) { return _upb_hasbit(msg, 5); }
 UPB_INLINE bool google_protobuf_FileOptions_py_generic_services(const google_protobuf_FileOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(19, 19), bool); }
-UPB_INLINE bool google_protobuf_FileOptions_has_java_generate_equals_and_hash(const google_protobuf_FileOptions *msg) { return _upb_has_field(msg, 6); }
+UPB_INLINE bool google_protobuf_FileOptions_has_java_generate_equals_and_hash(const google_protobuf_FileOptions *msg) { return _upb_hasbit(msg, 6); }
 UPB_INLINE bool google_protobuf_FileOptions_java_generate_equals_and_hash(const google_protobuf_FileOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(20, 20), bool); }
-UPB_INLINE bool google_protobuf_FileOptions_has_deprecated(const google_protobuf_FileOptions *msg) { return _upb_has_field(msg, 7); }
+UPB_INLINE bool google_protobuf_FileOptions_has_deprecated(const google_protobuf_FileOptions *msg) { return _upb_hasbit(msg, 7); }
 UPB_INLINE bool google_protobuf_FileOptions_deprecated(const google_protobuf_FileOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(21, 21), bool); }
-UPB_INLINE bool google_protobuf_FileOptions_has_java_string_check_utf8(const google_protobuf_FileOptions *msg) { return _upb_has_field(msg, 8); }
+UPB_INLINE bool google_protobuf_FileOptions_has_java_string_check_utf8(const google_protobuf_FileOptions *msg) { return _upb_hasbit(msg, 8); }
 UPB_INLINE bool google_protobuf_FileOptions_java_string_check_utf8(const google_protobuf_FileOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(22, 22), bool); }
-UPB_INLINE bool google_protobuf_FileOptions_has_cc_enable_arenas(const google_protobuf_FileOptions *msg) { return _upb_has_field(msg, 9); }
+UPB_INLINE bool google_protobuf_FileOptions_has_cc_enable_arenas(const google_protobuf_FileOptions *msg) { return _upb_hasbit(msg, 9); }
 UPB_INLINE bool google_protobuf_FileOptions_cc_enable_arenas(const google_protobuf_FileOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(23, 23), bool); }
-UPB_INLINE bool google_protobuf_FileOptions_has_objc_class_prefix(const google_protobuf_FileOptions *msg) { return _upb_has_field(msg, 14); }
+UPB_INLINE bool google_protobuf_FileOptions_has_objc_class_prefix(const google_protobuf_FileOptions *msg) { return _upb_hasbit(msg, 14); }
 UPB_INLINE upb_strview google_protobuf_FileOptions_objc_class_prefix(const google_protobuf_FileOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(52, 80), upb_strview); }
-UPB_INLINE bool google_protobuf_FileOptions_has_csharp_namespace(const google_protobuf_FileOptions *msg) { return _upb_has_field(msg, 15); }
+UPB_INLINE bool google_protobuf_FileOptions_has_csharp_namespace(const google_protobuf_FileOptions *msg) { return _upb_hasbit(msg, 15); }
 UPB_INLINE upb_strview google_protobuf_FileOptions_csharp_namespace(const google_protobuf_FileOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(60, 96), upb_strview); }
-UPB_INLINE bool google_protobuf_FileOptions_has_swift_prefix(const google_protobuf_FileOptions *msg) { return _upb_has_field(msg, 16); }
+UPB_INLINE bool google_protobuf_FileOptions_has_swift_prefix(const google_protobuf_FileOptions *msg) { return _upb_hasbit(msg, 16); }
 UPB_INLINE upb_strview google_protobuf_FileOptions_swift_prefix(const google_protobuf_FileOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(68, 112), upb_strview); }
-UPB_INLINE bool google_protobuf_FileOptions_has_php_class_prefix(const google_protobuf_FileOptions *msg) { return _upb_has_field(msg, 17); }
+UPB_INLINE bool google_protobuf_FileOptions_has_php_class_prefix(const google_protobuf_FileOptions *msg) { return _upb_hasbit(msg, 17); }
 UPB_INLINE upb_strview google_protobuf_FileOptions_php_class_prefix(const google_protobuf_FileOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(76, 128), upb_strview); }
-UPB_INLINE bool google_protobuf_FileOptions_has_php_namespace(const google_protobuf_FileOptions *msg) { return _upb_has_field(msg, 18); }
+UPB_INLINE bool google_protobuf_FileOptions_has_php_namespace(const google_protobuf_FileOptions *msg) { return _upb_hasbit(msg, 18); }
 UPB_INLINE upb_strview google_protobuf_FileOptions_php_namespace(const google_protobuf_FileOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(84, 144), upb_strview); }
-UPB_INLINE bool google_protobuf_FileOptions_has_php_generic_services(const google_protobuf_FileOptions *msg) { return _upb_has_field(msg, 10); }
+UPB_INLINE bool google_protobuf_FileOptions_has_php_generic_services(const google_protobuf_FileOptions *msg) { return _upb_hasbit(msg, 10); }
 UPB_INLINE bool google_protobuf_FileOptions_php_generic_services(const google_protobuf_FileOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(24, 24), bool); }
-UPB_INLINE bool google_protobuf_FileOptions_has_php_metadata_namespace(const google_protobuf_FileOptions *msg) { return _upb_has_field(msg, 19); }
+UPB_INLINE bool google_protobuf_FileOptions_has_php_metadata_namespace(const google_protobuf_FileOptions *msg) { return _upb_hasbit(msg, 19); }
 UPB_INLINE upb_strview google_protobuf_FileOptions_php_metadata_namespace(const google_protobuf_FileOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(92, 160), upb_strview); }
-UPB_INLINE bool google_protobuf_FileOptions_has_ruby_package(const google_protobuf_FileOptions *msg) { return _upb_has_field(msg, 20); }
+UPB_INLINE bool google_protobuf_FileOptions_has_ruby_package(const google_protobuf_FileOptions *msg) { return _upb_hasbit(msg, 20); }
 UPB_INLINE upb_strview google_protobuf_FileOptions_ruby_package(const google_protobuf_FileOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(100, 176), upb_strview); }
 UPB_INLINE bool google_protobuf_FileOptions_has_uninterpreted_option(const google_protobuf_FileOptions *msg) { return _upb_has_submsg_nohasbit(msg, UPB_SIZE(108, 192)); }
 UPB_INLINE const google_protobuf_UninterpretedOption* const* google_protobuf_FileOptions_uninterpreted_option(const google_protobuf_FileOptions *msg, size_t *len) { return (const google_protobuf_UninterpretedOption* const*)_upb_array_accessor(msg, UPB_SIZE(108, 192), len); }
@@ -2521,13 +2583,13 @@ UPB_INLINE char *google_protobuf_MessageOptions_serialize(const google_protobuf_
   return upb_encode(msg, &google_protobuf_MessageOptions_msginit, arena, len);
 }
 
-UPB_INLINE bool google_protobuf_MessageOptions_has_message_set_wire_format(const google_protobuf_MessageOptions *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_MessageOptions_has_message_set_wire_format(const google_protobuf_MessageOptions *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE bool google_protobuf_MessageOptions_message_set_wire_format(const google_protobuf_MessageOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(1, 1), bool); }
-UPB_INLINE bool google_protobuf_MessageOptions_has_no_standard_descriptor_accessor(const google_protobuf_MessageOptions *msg) { return _upb_has_field(msg, 2); }
+UPB_INLINE bool google_protobuf_MessageOptions_has_no_standard_descriptor_accessor(const google_protobuf_MessageOptions *msg) { return _upb_hasbit(msg, 2); }
 UPB_INLINE bool google_protobuf_MessageOptions_no_standard_descriptor_accessor(const google_protobuf_MessageOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(2, 2), bool); }
-UPB_INLINE bool google_protobuf_MessageOptions_has_deprecated(const google_protobuf_MessageOptions *msg) { return _upb_has_field(msg, 3); }
+UPB_INLINE bool google_protobuf_MessageOptions_has_deprecated(const google_protobuf_MessageOptions *msg) { return _upb_hasbit(msg, 3); }
 UPB_INLINE bool google_protobuf_MessageOptions_deprecated(const google_protobuf_MessageOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(3, 3), bool); }
-UPB_INLINE bool google_protobuf_MessageOptions_has_map_entry(const google_protobuf_MessageOptions *msg) { return _upb_has_field(msg, 4); }
+UPB_INLINE bool google_protobuf_MessageOptions_has_map_entry(const google_protobuf_MessageOptions *msg) { return _upb_hasbit(msg, 4); }
 UPB_INLINE bool google_protobuf_MessageOptions_map_entry(const google_protobuf_MessageOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(4, 4), bool); }
 UPB_INLINE bool google_protobuf_MessageOptions_has_uninterpreted_option(const google_protobuf_MessageOptions *msg) { return _upb_has_submsg_nohasbit(msg, UPB_SIZE(8, 8)); }
 UPB_INLINE const google_protobuf_UninterpretedOption* const* google_protobuf_MessageOptions_uninterpreted_option(const google_protobuf_MessageOptions *msg, size_t *len) { return (const google_protobuf_UninterpretedOption* const*)_upb_array_accessor(msg, UPB_SIZE(8, 8), len); }
@@ -2576,17 +2638,17 @@ UPB_INLINE char *google_protobuf_FieldOptions_serialize(const google_protobuf_Fi
   return upb_encode(msg, &google_protobuf_FieldOptions_msginit, arena, len);
 }
 
-UPB_INLINE bool google_protobuf_FieldOptions_has_ctype(const google_protobuf_FieldOptions *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_FieldOptions_has_ctype(const google_protobuf_FieldOptions *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE int32_t google_protobuf_FieldOptions_ctype(const google_protobuf_FieldOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(8, 8), int32_t); }
-UPB_INLINE bool google_protobuf_FieldOptions_has_packed(const google_protobuf_FieldOptions *msg) { return _upb_has_field(msg, 3); }
+UPB_INLINE bool google_protobuf_FieldOptions_has_packed(const google_protobuf_FieldOptions *msg) { return _upb_hasbit(msg, 3); }
 UPB_INLINE bool google_protobuf_FieldOptions_packed(const google_protobuf_FieldOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(24, 24), bool); }
-UPB_INLINE bool google_protobuf_FieldOptions_has_deprecated(const google_protobuf_FieldOptions *msg) { return _upb_has_field(msg, 4); }
+UPB_INLINE bool google_protobuf_FieldOptions_has_deprecated(const google_protobuf_FieldOptions *msg) { return _upb_hasbit(msg, 4); }
 UPB_INLINE bool google_protobuf_FieldOptions_deprecated(const google_protobuf_FieldOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(25, 25), bool); }
-UPB_INLINE bool google_protobuf_FieldOptions_has_lazy(const google_protobuf_FieldOptions *msg) { return _upb_has_field(msg, 5); }
+UPB_INLINE bool google_protobuf_FieldOptions_has_lazy(const google_protobuf_FieldOptions *msg) { return _upb_hasbit(msg, 5); }
 UPB_INLINE bool google_protobuf_FieldOptions_lazy(const google_protobuf_FieldOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(26, 26), bool); }
-UPB_INLINE bool google_protobuf_FieldOptions_has_jstype(const google_protobuf_FieldOptions *msg) { return _upb_has_field(msg, 2); }
+UPB_INLINE bool google_protobuf_FieldOptions_has_jstype(const google_protobuf_FieldOptions *msg) { return _upb_hasbit(msg, 2); }
 UPB_INLINE int32_t google_protobuf_FieldOptions_jstype(const google_protobuf_FieldOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(16, 16), int32_t); }
-UPB_INLINE bool google_protobuf_FieldOptions_has_weak(const google_protobuf_FieldOptions *msg) { return _upb_has_field(msg, 6); }
+UPB_INLINE bool google_protobuf_FieldOptions_has_weak(const google_protobuf_FieldOptions *msg) { return _upb_hasbit(msg, 6); }
 UPB_INLINE bool google_protobuf_FieldOptions_weak(const google_protobuf_FieldOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(27, 27), bool); }
 UPB_INLINE bool google_protobuf_FieldOptions_has_uninterpreted_option(const google_protobuf_FieldOptions *msg) { return _upb_has_submsg_nohasbit(msg, UPB_SIZE(28, 32)); }
 UPB_INLINE const google_protobuf_UninterpretedOption* const* google_protobuf_FieldOptions_uninterpreted_option(const google_protobuf_FieldOptions *msg, size_t *len) { return (const google_protobuf_UninterpretedOption* const*)_upb_array_accessor(msg, UPB_SIZE(28, 32), len); }
@@ -2674,9 +2736,9 @@ UPB_INLINE char *google_protobuf_EnumOptions_serialize(const google_protobuf_Enu
   return upb_encode(msg, &google_protobuf_EnumOptions_msginit, arena, len);
 }
 
-UPB_INLINE bool google_protobuf_EnumOptions_has_allow_alias(const google_protobuf_EnumOptions *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_EnumOptions_has_allow_alias(const google_protobuf_EnumOptions *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE bool google_protobuf_EnumOptions_allow_alias(const google_protobuf_EnumOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(1, 1), bool); }
-UPB_INLINE bool google_protobuf_EnumOptions_has_deprecated(const google_protobuf_EnumOptions *msg) { return _upb_has_field(msg, 2); }
+UPB_INLINE bool google_protobuf_EnumOptions_has_deprecated(const google_protobuf_EnumOptions *msg) { return _upb_hasbit(msg, 2); }
 UPB_INLINE bool google_protobuf_EnumOptions_deprecated(const google_protobuf_EnumOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(2, 2), bool); }
 UPB_INLINE bool google_protobuf_EnumOptions_has_uninterpreted_option(const google_protobuf_EnumOptions *msg) { return _upb_has_submsg_nohasbit(msg, UPB_SIZE(4, 8)); }
 UPB_INLINE const google_protobuf_UninterpretedOption* const* google_protobuf_EnumOptions_uninterpreted_option(const google_protobuf_EnumOptions *msg, size_t *len) { return (const google_protobuf_UninterpretedOption* const*)_upb_array_accessor(msg, UPB_SIZE(4, 8), len); }
@@ -2717,7 +2779,7 @@ UPB_INLINE char *google_protobuf_EnumValueOptions_serialize(const google_protobu
   return upb_encode(msg, &google_protobuf_EnumValueOptions_msginit, arena, len);
 }
 
-UPB_INLINE bool google_protobuf_EnumValueOptions_has_deprecated(const google_protobuf_EnumValueOptions *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_EnumValueOptions_has_deprecated(const google_protobuf_EnumValueOptions *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE bool google_protobuf_EnumValueOptions_deprecated(const google_protobuf_EnumValueOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(1, 1), bool); }
 UPB_INLINE bool google_protobuf_EnumValueOptions_has_uninterpreted_option(const google_protobuf_EnumValueOptions *msg) { return _upb_has_submsg_nohasbit(msg, UPB_SIZE(4, 8)); }
 UPB_INLINE const google_protobuf_UninterpretedOption* const* google_protobuf_EnumValueOptions_uninterpreted_option(const google_protobuf_EnumValueOptions *msg, size_t *len) { return (const google_protobuf_UninterpretedOption* const*)_upb_array_accessor(msg, UPB_SIZE(4, 8), len); }
@@ -2754,7 +2816,7 @@ UPB_INLINE char *google_protobuf_ServiceOptions_serialize(const google_protobuf_
   return upb_encode(msg, &google_protobuf_ServiceOptions_msginit, arena, len);
 }
 
-UPB_INLINE bool google_protobuf_ServiceOptions_has_deprecated(const google_protobuf_ServiceOptions *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_ServiceOptions_has_deprecated(const google_protobuf_ServiceOptions *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE bool google_protobuf_ServiceOptions_deprecated(const google_protobuf_ServiceOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(1, 1), bool); }
 UPB_INLINE bool google_protobuf_ServiceOptions_has_uninterpreted_option(const google_protobuf_ServiceOptions *msg) { return _upb_has_submsg_nohasbit(msg, UPB_SIZE(4, 8)); }
 UPB_INLINE const google_protobuf_UninterpretedOption* const* google_protobuf_ServiceOptions_uninterpreted_option(const google_protobuf_ServiceOptions *msg, size_t *len) { return (const google_protobuf_UninterpretedOption* const*)_upb_array_accessor(msg, UPB_SIZE(4, 8), len); }
@@ -2791,9 +2853,9 @@ UPB_INLINE char *google_protobuf_MethodOptions_serialize(const google_protobuf_M
   return upb_encode(msg, &google_protobuf_MethodOptions_msginit, arena, len);
 }
 
-UPB_INLINE bool google_protobuf_MethodOptions_has_deprecated(const google_protobuf_MethodOptions *msg) { return _upb_has_field(msg, 2); }
+UPB_INLINE bool google_protobuf_MethodOptions_has_deprecated(const google_protobuf_MethodOptions *msg) { return _upb_hasbit(msg, 2); }
 UPB_INLINE bool google_protobuf_MethodOptions_deprecated(const google_protobuf_MethodOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(16, 16), bool); }
-UPB_INLINE bool google_protobuf_MethodOptions_has_idempotency_level(const google_protobuf_MethodOptions *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_MethodOptions_has_idempotency_level(const google_protobuf_MethodOptions *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE int32_t google_protobuf_MethodOptions_idempotency_level(const google_protobuf_MethodOptions *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(8, 8), int32_t); }
 UPB_INLINE bool google_protobuf_MethodOptions_has_uninterpreted_option(const google_protobuf_MethodOptions *msg) { return _upb_has_submsg_nohasbit(msg, UPB_SIZE(20, 24)); }
 UPB_INLINE const google_protobuf_UninterpretedOption* const* google_protobuf_MethodOptions_uninterpreted_option(const google_protobuf_MethodOptions *msg, size_t *len) { return (const google_protobuf_UninterpretedOption* const*)_upb_array_accessor(msg, UPB_SIZE(20, 24), len); }
@@ -2836,17 +2898,17 @@ UPB_INLINE char *google_protobuf_UninterpretedOption_serialize(const google_prot
 
 UPB_INLINE bool google_protobuf_UninterpretedOption_has_name(const google_protobuf_UninterpretedOption *msg) { return _upb_has_submsg_nohasbit(msg, UPB_SIZE(56, 80)); }
 UPB_INLINE const google_protobuf_UninterpretedOption_NamePart* const* google_protobuf_UninterpretedOption_name(const google_protobuf_UninterpretedOption *msg, size_t *len) { return (const google_protobuf_UninterpretedOption_NamePart* const*)_upb_array_accessor(msg, UPB_SIZE(56, 80), len); }
-UPB_INLINE bool google_protobuf_UninterpretedOption_has_identifier_value(const google_protobuf_UninterpretedOption *msg) { return _upb_has_field(msg, 4); }
+UPB_INLINE bool google_protobuf_UninterpretedOption_has_identifier_value(const google_protobuf_UninterpretedOption *msg) { return _upb_hasbit(msg, 4); }
 UPB_INLINE upb_strview google_protobuf_UninterpretedOption_identifier_value(const google_protobuf_UninterpretedOption *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(32, 32), upb_strview); }
-UPB_INLINE bool google_protobuf_UninterpretedOption_has_positive_int_value(const google_protobuf_UninterpretedOption *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_UninterpretedOption_has_positive_int_value(const google_protobuf_UninterpretedOption *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE uint64_t google_protobuf_UninterpretedOption_positive_int_value(const google_protobuf_UninterpretedOption *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(8, 8), uint64_t); }
-UPB_INLINE bool google_protobuf_UninterpretedOption_has_negative_int_value(const google_protobuf_UninterpretedOption *msg) { return _upb_has_field(msg, 2); }
+UPB_INLINE bool google_protobuf_UninterpretedOption_has_negative_int_value(const google_protobuf_UninterpretedOption *msg) { return _upb_hasbit(msg, 2); }
 UPB_INLINE int64_t google_protobuf_UninterpretedOption_negative_int_value(const google_protobuf_UninterpretedOption *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(16, 16), int64_t); }
-UPB_INLINE bool google_protobuf_UninterpretedOption_has_double_value(const google_protobuf_UninterpretedOption *msg) { return _upb_has_field(msg, 3); }
+UPB_INLINE bool google_protobuf_UninterpretedOption_has_double_value(const google_protobuf_UninterpretedOption *msg) { return _upb_hasbit(msg, 3); }
 UPB_INLINE double google_protobuf_UninterpretedOption_double_value(const google_protobuf_UninterpretedOption *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(24, 24), double); }
-UPB_INLINE bool google_protobuf_UninterpretedOption_has_string_value(const google_protobuf_UninterpretedOption *msg) { return _upb_has_field(msg, 5); }
+UPB_INLINE bool google_protobuf_UninterpretedOption_has_string_value(const google_protobuf_UninterpretedOption *msg) { return _upb_hasbit(msg, 5); }
 UPB_INLINE upb_strview google_protobuf_UninterpretedOption_string_value(const google_protobuf_UninterpretedOption *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(40, 48), upb_strview); }
-UPB_INLINE bool google_protobuf_UninterpretedOption_has_aggregate_value(const google_protobuf_UninterpretedOption *msg) { return _upb_has_field(msg, 6); }
+UPB_INLINE bool google_protobuf_UninterpretedOption_has_aggregate_value(const google_protobuf_UninterpretedOption *msg) { return _upb_hasbit(msg, 6); }
 UPB_INLINE upb_strview google_protobuf_UninterpretedOption_aggregate_value(const google_protobuf_UninterpretedOption *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(48, 64), upb_strview); }
 
 UPB_INLINE google_protobuf_UninterpretedOption_NamePart** google_protobuf_UninterpretedOption_mutable_name(google_protobuf_UninterpretedOption *msg, size_t *len) {
@@ -2901,9 +2963,9 @@ UPB_INLINE char *google_protobuf_UninterpretedOption_NamePart_serialize(const go
   return upb_encode(msg, &google_protobuf_UninterpretedOption_NamePart_msginit, arena, len);
 }
 
-UPB_INLINE bool google_protobuf_UninterpretedOption_NamePart_has_name_part(const google_protobuf_UninterpretedOption_NamePart *msg) { return _upb_has_field(msg, 2); }
+UPB_INLINE bool google_protobuf_UninterpretedOption_NamePart_has_name_part(const google_protobuf_UninterpretedOption_NamePart *msg) { return _upb_hasbit(msg, 2); }
 UPB_INLINE upb_strview google_protobuf_UninterpretedOption_NamePart_name_part(const google_protobuf_UninterpretedOption_NamePart *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(4, 8), upb_strview); }
-UPB_INLINE bool google_protobuf_UninterpretedOption_NamePart_has_is_extension(const google_protobuf_UninterpretedOption_NamePart *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_UninterpretedOption_NamePart_has_is_extension(const google_protobuf_UninterpretedOption_NamePart *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE bool google_protobuf_UninterpretedOption_NamePart_is_extension(const google_protobuf_UninterpretedOption_NamePart *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(1, 1), bool); }
 
 UPB_INLINE void google_protobuf_UninterpretedOption_NamePart_set_name_part(google_protobuf_UninterpretedOption_NamePart *msg, upb_strview value) {
@@ -2962,9 +3024,9 @@ UPB_INLINE char *google_protobuf_SourceCodeInfo_Location_serialize(const google_
 
 UPB_INLINE int32_t const* google_protobuf_SourceCodeInfo_Location_path(const google_protobuf_SourceCodeInfo_Location *msg, size_t *len) { return (int32_t const*)_upb_array_accessor(msg, UPB_SIZE(20, 40), len); }
 UPB_INLINE int32_t const* google_protobuf_SourceCodeInfo_Location_span(const google_protobuf_SourceCodeInfo_Location *msg, size_t *len) { return (int32_t const*)_upb_array_accessor(msg, UPB_SIZE(24, 48), len); }
-UPB_INLINE bool google_protobuf_SourceCodeInfo_Location_has_leading_comments(const google_protobuf_SourceCodeInfo_Location *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_SourceCodeInfo_Location_has_leading_comments(const google_protobuf_SourceCodeInfo_Location *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE upb_strview google_protobuf_SourceCodeInfo_Location_leading_comments(const google_protobuf_SourceCodeInfo_Location *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(4, 8), upb_strview); }
-UPB_INLINE bool google_protobuf_SourceCodeInfo_Location_has_trailing_comments(const google_protobuf_SourceCodeInfo_Location *msg) { return _upb_has_field(msg, 2); }
+UPB_INLINE bool google_protobuf_SourceCodeInfo_Location_has_trailing_comments(const google_protobuf_SourceCodeInfo_Location *msg) { return _upb_hasbit(msg, 2); }
 UPB_INLINE upb_strview google_protobuf_SourceCodeInfo_Location_trailing_comments(const google_protobuf_SourceCodeInfo_Location *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(12, 24), upb_strview); }
 UPB_INLINE upb_strview const* google_protobuf_SourceCodeInfo_Location_leading_detached_comments(const google_protobuf_SourceCodeInfo_Location *msg, size_t *len) { return (upb_strview const*)_upb_array_accessor(msg, UPB_SIZE(28, 56), len); }
 
@@ -3053,11 +3115,11 @@ UPB_INLINE char *google_protobuf_GeneratedCodeInfo_Annotation_serialize(const go
 }
 
 UPB_INLINE int32_t const* google_protobuf_GeneratedCodeInfo_Annotation_path(const google_protobuf_GeneratedCodeInfo_Annotation *msg, size_t *len) { return (int32_t const*)_upb_array_accessor(msg, UPB_SIZE(20, 32), len); }
-UPB_INLINE bool google_protobuf_GeneratedCodeInfo_Annotation_has_source_file(const google_protobuf_GeneratedCodeInfo_Annotation *msg) { return _upb_has_field(msg, 3); }
+UPB_INLINE bool google_protobuf_GeneratedCodeInfo_Annotation_has_source_file(const google_protobuf_GeneratedCodeInfo_Annotation *msg) { return _upb_hasbit(msg, 3); }
 UPB_INLINE upb_strview google_protobuf_GeneratedCodeInfo_Annotation_source_file(const google_protobuf_GeneratedCodeInfo_Annotation *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(12, 16), upb_strview); }
-UPB_INLINE bool google_protobuf_GeneratedCodeInfo_Annotation_has_begin(const google_protobuf_GeneratedCodeInfo_Annotation *msg) { return _upb_has_field(msg, 1); }
+UPB_INLINE bool google_protobuf_GeneratedCodeInfo_Annotation_has_begin(const google_protobuf_GeneratedCodeInfo_Annotation *msg) { return _upb_hasbit(msg, 1); }
 UPB_INLINE int32_t google_protobuf_GeneratedCodeInfo_Annotation_begin(const google_protobuf_GeneratedCodeInfo_Annotation *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(4, 4), int32_t); }
-UPB_INLINE bool google_protobuf_GeneratedCodeInfo_Annotation_has_end(const google_protobuf_GeneratedCodeInfo_Annotation *msg) { return _upb_has_field(msg, 2); }
+UPB_INLINE bool google_protobuf_GeneratedCodeInfo_Annotation_has_end(const google_protobuf_GeneratedCodeInfo_Annotation *msg) { return _upb_hasbit(msg, 2); }
 UPB_INLINE int32_t google_protobuf_GeneratedCodeInfo_Annotation_end(const google_protobuf_GeneratedCodeInfo_Annotation *msg) { return *UPB_PTR_AT(msg, UPB_SIZE(8, 8), int32_t); }
 
 UPB_INLINE int32_t* google_protobuf_GeneratedCodeInfo_Annotation_mutable_path(google_protobuf_GeneratedCodeInfo_Annotation *msg, size_t *len) {
@@ -3263,6 +3325,7 @@ int upb_msgdef_numrealoneofs(const upb_msgdef *m);
 upb_syntax_t upb_msgdef_syntax(const upb_msgdef *m);
 bool upb_msgdef_mapentry(const upb_msgdef *m);
 upb_wellknowntype_t upb_msgdef_wellknowntype(const upb_msgdef *m);
+bool upb_msgdef_iswrapper(const upb_msgdef *m);
 bool upb_msgdef_isnumberwrapper(const upb_msgdef *m);
 const upb_fielddef *upb_msgdef_itof(const upb_msgdef *m, uint32_t i);
 const upb_fielddef *upb_msgdef_ntof(const upb_msgdef *m, const char *name,
@@ -3413,6 +3476,166 @@ bool _upb_symtab_loaddefinit(upb_symtab *s, const upb_def_init *init);
 #endif  /* __cplusplus */
 
 #endif /* UPB_DEF_H_ */
+/* This file was generated by upbc (the upb compiler) from the input
+ * file:
+ *
+ *     google/protobuf/descriptor.proto
+ *
+ * Do not edit -- your changes will be discarded when the file is
+ * regenerated. */
+
+#ifndef GOOGLE_PROTOBUF_DESCRIPTOR_PROTO_UPBDEFS_H_
+#define GOOGLE_PROTOBUF_DESCRIPTOR_PROTO_UPBDEFS_H_
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
+
+extern upb_def_init google_protobuf_descriptor_proto_upbdefinit;
+
+UPB_INLINE const upb_msgdef *google_protobuf_FileDescriptorSet_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.FileDescriptorSet");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_FileDescriptorProto_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.FileDescriptorProto");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_DescriptorProto_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.DescriptorProto");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_DescriptorProto_ExtensionRange_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.DescriptorProto.ExtensionRange");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_DescriptorProto_ReservedRange_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.DescriptorProto.ReservedRange");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_ExtensionRangeOptions_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.ExtensionRangeOptions");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_FieldDescriptorProto_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.FieldDescriptorProto");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_OneofDescriptorProto_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.OneofDescriptorProto");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_EnumDescriptorProto_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.EnumDescriptorProto");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_EnumDescriptorProto_EnumReservedRange_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.EnumDescriptorProto.EnumReservedRange");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_EnumValueDescriptorProto_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.EnumValueDescriptorProto");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_ServiceDescriptorProto_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.ServiceDescriptorProto");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_MethodDescriptorProto_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.MethodDescriptorProto");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_FileOptions_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.FileOptions");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_MessageOptions_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.MessageOptions");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_FieldOptions_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.FieldOptions");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_OneofOptions_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.OneofOptions");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_EnumOptions_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.EnumOptions");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_EnumValueOptions_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.EnumValueOptions");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_ServiceOptions_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.ServiceOptions");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_MethodOptions_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.MethodOptions");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_UninterpretedOption_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.UninterpretedOption");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_UninterpretedOption_NamePart_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.UninterpretedOption.NamePart");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_SourceCodeInfo_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.SourceCodeInfo");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_SourceCodeInfo_Location_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.SourceCodeInfo.Location");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_GeneratedCodeInfo_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.GeneratedCodeInfo");
+}
+
+UPB_INLINE const upb_msgdef *google_protobuf_GeneratedCodeInfo_Annotation_getmsgdef(upb_symtab *s) {
+  _upb_symtab_loaddefinit(s, &google_protobuf_descriptor_proto_upbdefinit);
+  return upb_symtab_lookupmsg(s, "google.protobuf.GeneratedCodeInfo.Annotation");
+}
+
+#ifdef __cplusplus
+}  /* extern "C" */
+#endif
+
+
+#endif  /* GOOGLE_PROTOBUF_DESCRIPTOR_PROTO_UPBDEFS_H_ */
 
 #ifndef UPB_REFLECTION_H_
 #define UPB_REFLECTION_H_
@@ -3455,8 +3678,9 @@ upb_mutmsgval upb_msg_mutable(upb_msg *msg, const upb_fielddef *f, upb_arena *a)
 /* May only be called for fields where upb_fielddef_haspresence(f) == true. */
 bool upb_msg_has(const upb_msg *msg, const upb_fielddef *f);
 
-/* Returns whether any field is set in the oneof. */
-bool upb_msg_hasoneof(const upb_msg *msg, const upb_oneofdef *o);
+/* Returns the field that is set in the oneof, or NULL if none are set. */
+const upb_fielddef *upb_msg_whichoneof(const upb_msg *msg,
+                                       const upb_oneofdef *o);
 
 /* Sets the given field to the given value.  For a msg/array/map/string, the
  * value must be in the same arena.  */
@@ -3465,6 +3689,9 @@ void upb_msg_set(upb_msg *msg, const upb_fielddef *f, upb_msgval val,
 
 /* Clears any field presence and sets the value back to its default. */
 void upb_msg_clearfield(upb_msg *msg, const upb_fielddef *f);
+
+/* Clear all data and unknown fields. */
+void upb_msg_clear(upb_msg *msg, const upb_msgdef *m);
 
 /* Iterate over present fields.
  *
@@ -3489,6 +3716,9 @@ bool upb_msg_next(const upb_msg *msg, const upb_msgdef *m,
  * is copied into the message instance. */
 void upb_msg_addunknown(upb_msg *msg, const char *data, size_t len,
                         upb_arena *arena);
+
+/* Clears all unknown field data from this message and all submessages. */
+bool upb_msg_discardunknown(upb_msg *msg, const upb_msgdef *m, int maxdepth);
 
 /* Returns a reference to the message's unknown data. */
 const char *upb_msg_getunknown(const upb_msg *msg, size_t *len);
@@ -3554,6 +3784,11 @@ bool upb_map_delete(upb_map *map, upb_msgval key);
 /* Advances to the next entry.  Returns false if no more entries are present. */
 bool upb_mapiter_next(const upb_map *map, size_t *iter);
 
+/* Returns true if the iterator still points to a valid entry, or false if the
+ * iterator is past the last element. It is an error to call this function with
+ * UPB_MAP_BEGIN (you must call next() at least once first). */
+bool upb_mapiter_done(const upb_map *map, size_t iter);
+
 /* Returns the key and value for this entry of the map. */
 upb_msgval upb_mapiter_key(const upb_map *map, size_t iter);
 upb_msgval upb_mapiter_value(const upb_map *map, size_t iter);
@@ -3564,3209 +3799,63 @@ void upb_mapiter_setvalue(upb_map *map, size_t iter, upb_msgval value);
 
 
 #endif /* UPB_REFLECTION_H_ */
-/*
-** upb::Handlers (upb_handlers)
-**
-** A upb_handlers is like a virtual table for a upb_msgdef.  Each field of the
-** message can have associated functions that will be called when we are
-** parsing or visiting a stream of data.  This is similar to how handlers work
-** in SAX (the Simple API for XML).
-**
-** The handlers have no idea where the data is coming from, so a single set of
-** handlers could be used with two completely different data sources (for
-** example, a parser and a visitor over in-memory objects).  This decoupling is
-** the most important feature of upb, because it allows parsers and serializers
-** to be highly reusable.
-**
-** This is a mixed C/C++ interface that offers a full API to both languages.
-** See the top-level README for more information.
-*/
 
-#ifndef UPB_HANDLERS_H
-#define UPB_HANDLERS_H
+#ifndef UPB_JSONDECODE_H_
+#define UPB_JSONDECODE_H_
 
-
-
-#ifdef __cplusplus
-namespace upb {
-class HandlersPtr;
-class HandlerCache;
-template <class T> class Handler;
-template <class T> struct CanonicalType;
-}  /* namespace upb */
-#endif
-
-
-/* The maximum depth that the handler graph can have.  This is a resource limit
- * for the C stack since we sometimes need to recursively traverse the graph.
- * Cycles are ok; the traversal will stop when it detects a cycle, but we must
- * hit the cycle before the maximum depth is reached.
- *
- * If having a single static limit is too inflexible, we can add another variant
- * of Handlers::Freeze that allows specifying this as a parameter. */
-#define UPB_MAX_HANDLER_DEPTH 64
-
-/* All the different types of handlers that can be registered.
- * Only needed for the advanced functions in upb::Handlers. */
-typedef enum {
-  UPB_HANDLER_INT32,
-  UPB_HANDLER_INT64,
-  UPB_HANDLER_UINT32,
-  UPB_HANDLER_UINT64,
-  UPB_HANDLER_FLOAT,
-  UPB_HANDLER_DOUBLE,
-  UPB_HANDLER_BOOL,
-  UPB_HANDLER_STARTSTR,
-  UPB_HANDLER_STRING,
-  UPB_HANDLER_ENDSTR,
-  UPB_HANDLER_STARTSUBMSG,
-  UPB_HANDLER_ENDSUBMSG,
-  UPB_HANDLER_STARTSEQ,
-  UPB_HANDLER_ENDSEQ
-} upb_handlertype_t;
-
-#define UPB_HANDLER_MAX (UPB_HANDLER_ENDSEQ+1)
-
-#define UPB_BREAK NULL
-
-/* A convenient definition for when no closure is needed. */
-extern char _upb_noclosure;
-#define UPB_NO_CLOSURE &_upb_noclosure
-
-/* A selector refers to a specific field handler in the Handlers object
- * (for example: the STARTSUBMSG handler for field "field15"). */
-typedef int32_t upb_selector_t;
-
-/* Static selectors for upb::Handlers. */
-#define UPB_STARTMSG_SELECTOR 0
-#define UPB_ENDMSG_SELECTOR 1
-#define UPB_UNKNOWN_SELECTOR 2
-#define UPB_STATIC_SELECTOR_COUNT 3  /* Warning: also in upb/def.c. */
-
-/* Static selectors for upb::BytesHandler. */
-#define UPB_STARTSTR_SELECTOR 0
-#define UPB_STRING_SELECTOR 1
-#define UPB_ENDSTR_SELECTOR 2
-
-#ifdef __cplusplus
-template<class T> const void *UniquePtrForType() {
-  static const char ch = 0;
-  return &ch;
-}
-#endif
-
-/* upb_handlers ************************************************************/
-
-/* Handler attributes, to be registered with the handler itself. */
-typedef struct {
-  const void *handler_data;
-  const void *closure_type;
-  const void *return_closure_type;
-  bool alwaysok;
-} upb_handlerattr;
-
-#define UPB_HANDLERATTR_INIT {NULL, NULL, NULL, false}
-
-/* Bufhandle, data passed along with a buffer to indicate its provenance. */
-typedef struct {
-  /* The beginning of the buffer.  This may be different than the pointer
-   * passed to a StringBuf handler because the handler may receive data
-   * that is from the middle or end of a larger buffer. */
-  const char *buf;
-
-  /* The offset within the attached object where this buffer begins.  Only
-   * meaningful if there is an attached object. */
-  size_t objofs;
-
-  /* The attached object (if any) and a pointer representing its type. */
-  const void *obj;
-  const void *objtype;
-
-#ifdef __cplusplus
-  template <class T>
-  void SetAttachedObject(const T* _obj) {
-    obj = _obj;
-    objtype = UniquePtrForType<T>();
-  }
-
-  template <class T>
-  const T *GetAttachedObject() const {
-    return objtype == UniquePtrForType<T>() ? static_cast<const T *>(obj)
-                                            : NULL;
-  }
-#endif
-} upb_bufhandle;
-
-#define UPB_BUFHANDLE_INIT {NULL, 0, NULL, NULL}
-
-/* Handler function typedefs. */
-typedef void upb_handlerfree(void *d);
-typedef bool upb_unknown_handlerfunc(void *c, const void *hd, const char *buf,
-                                     size_t n);
-typedef bool upb_startmsg_handlerfunc(void *c, const void*);
-typedef bool upb_endmsg_handlerfunc(void *c, const void *, upb_status *status);
-typedef void* upb_startfield_handlerfunc(void *c, const void *hd);
-typedef bool upb_endfield_handlerfunc(void *c, const void *hd);
-typedef bool upb_int32_handlerfunc(void *c, const void *hd, int32_t val);
-typedef bool upb_int64_handlerfunc(void *c, const void *hd, int64_t val);
-typedef bool upb_uint32_handlerfunc(void *c, const void *hd, uint32_t val);
-typedef bool upb_uint64_handlerfunc(void *c, const void *hd, uint64_t val);
-typedef bool upb_float_handlerfunc(void *c, const void *hd, float val);
-typedef bool upb_double_handlerfunc(void *c, const void *hd, double val);
-typedef bool upb_bool_handlerfunc(void *c, const void *hd, bool val);
-typedef void *upb_startstr_handlerfunc(void *c, const void *hd,
-                                       size_t size_hint);
-typedef size_t upb_string_handlerfunc(void *c, const void *hd, const char *buf,
-                                      size_t n, const upb_bufhandle* handle);
-
-struct upb_handlers;
-typedef struct upb_handlers upb_handlers;
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Mutating accessors. */
-const upb_status *upb_handlers_status(upb_handlers *h);
-void upb_handlers_clearerr(upb_handlers *h);
-const upb_msgdef *upb_handlers_msgdef(const upb_handlers *h);
-bool upb_handlers_addcleanup(upb_handlers *h, void *p, upb_handlerfree *hfree);
-bool upb_handlers_setunknown(upb_handlers *h, upb_unknown_handlerfunc *func,
-                             const upb_handlerattr *attr);
-bool upb_handlers_setstartmsg(upb_handlers *h, upb_startmsg_handlerfunc *func,
-                              const upb_handlerattr *attr);
-bool upb_handlers_setendmsg(upb_handlers *h, upb_endmsg_handlerfunc *func,
-                            const upb_handlerattr *attr);
-bool upb_handlers_setint32(upb_handlers *h, const upb_fielddef *f,
-                           upb_int32_handlerfunc *func,
-                           const upb_handlerattr *attr);
-bool upb_handlers_setint64(upb_handlers *h, const upb_fielddef *f,
-                           upb_int64_handlerfunc *func,
-                           const upb_handlerattr *attr);
-bool upb_handlers_setuint32(upb_handlers *h, const upb_fielddef *f,
-                            upb_uint32_handlerfunc *func,
-                            const upb_handlerattr *attr);
-bool upb_handlers_setuint64(upb_handlers *h, const upb_fielddef *f,
-                            upb_uint64_handlerfunc *func,
-                            const upb_handlerattr *attr);
-bool upb_handlers_setfloat(upb_handlers *h, const upb_fielddef *f,
-                           upb_float_handlerfunc *func,
-                           const upb_handlerattr *attr);
-bool upb_handlers_setdouble(upb_handlers *h, const upb_fielddef *f,
-                            upb_double_handlerfunc *func,
-                            const upb_handlerattr *attr);
-bool upb_handlers_setbool(upb_handlers *h, const upb_fielddef *f,
-                          upb_bool_handlerfunc *func,
-                          const upb_handlerattr *attr);
-bool upb_handlers_setstartstr(upb_handlers *h, const upb_fielddef *f,
-                              upb_startstr_handlerfunc *func,
-                              const upb_handlerattr *attr);
-bool upb_handlers_setstring(upb_handlers *h, const upb_fielddef *f,
-                            upb_string_handlerfunc *func,
-                            const upb_handlerattr *attr);
-bool upb_handlers_setendstr(upb_handlers *h, const upb_fielddef *f,
-                            upb_endfield_handlerfunc *func,
-                            const upb_handlerattr *attr);
-bool upb_handlers_setstartseq(upb_handlers *h, const upb_fielddef *f,
-                              upb_startfield_handlerfunc *func,
-                              const upb_handlerattr *attr);
-bool upb_handlers_setstartsubmsg(upb_handlers *h, const upb_fielddef *f,
-                                 upb_startfield_handlerfunc *func,
-                                 const upb_handlerattr *attr);
-bool upb_handlers_setendsubmsg(upb_handlers *h, const upb_fielddef *f,
-                               upb_endfield_handlerfunc *func,
-                               const upb_handlerattr *attr);
-bool upb_handlers_setendseq(upb_handlers *h, const upb_fielddef *f,
-                            upb_endfield_handlerfunc *func,
-                            const upb_handlerattr *attr);
-
-/* Read-only accessors. */
-const upb_handlers *upb_handlers_getsubhandlers(const upb_handlers *h,
-                                                const upb_fielddef *f);
-const upb_handlers *upb_handlers_getsubhandlers_sel(const upb_handlers *h,
-                                                    upb_selector_t sel);
-upb_func *upb_handlers_gethandler(const upb_handlers *h, upb_selector_t s,
-                                  const void **handler_data);
-bool upb_handlers_getattr(const upb_handlers *h, upb_selector_t s,
-                          upb_handlerattr *attr);
-
-/* "Static" methods */
-upb_handlertype_t upb_handlers_getprimitivehandlertype(const upb_fielddef *f);
-bool upb_handlers_getselector(const upb_fielddef *f, upb_handlertype_t type,
-                              upb_selector_t *s);
-UPB_INLINE upb_selector_t upb_handlers_getendselector(upb_selector_t start) {
-  return start + 1;
-}
-
-#ifdef __cplusplus
-}  /* extern "C" */
-
-namespace upb {
-typedef upb_handlers Handlers;
-}
-
-/* Convenience macros for creating a Handler object that is wrapped with a
- * type-safe wrapper function that converts the "void*" parameters/returns
- * of the underlying C API into nice C++ function.
- *
- * Sample usage:
- *   void OnValue1(MyClosure* c, const MyHandlerData* d, int32_t val) {
- *     // do stuff ...
- *   }
- *
- *   // Handler that doesn't need any data bound to it.
- *   void OnValue2(MyClosure* c, int32_t val) {
- *     // do stuff ...
- *   }
- *
- *   // Handler that returns bool so it can return failure if necessary.
- *   bool OnValue3(MyClosure* c, int32_t val) {
- *     // do stuff ...
- *     return ok;
- *   }
- *
- *   // Member function handler.
- *   class MyClosure {
- *    public:
- *     void OnValue(int32_t val) {
- *       // do stuff ...
- *     }
- *   };
- *
- *   // Takes ownership of the MyHandlerData.
- *   handlers->SetInt32Handler(f1, UpbBind(OnValue1, new MyHandlerData(...)));
- *   handlers->SetInt32Handler(f2, UpbMakeHandler(OnValue2));
- *   handlers->SetInt32Handler(f1, UpbMakeHandler(OnValue3));
- *   handlers->SetInt32Handler(f2, UpbMakeHandler(&MyClosure::OnValue));
- */
-
-/* In C++11, the "template" disambiguator can appear even outside templates,
- * so all calls can safely use this pair of macros. */
-
-#define UpbMakeHandler(f) upb::MatchFunc(f).template GetFunc<f>()
-
-/* We have to be careful to only evaluate "d" once. */
-#define UpbBind(f, d) upb::MatchFunc(f).template GetFunc<f>((d))
-
-/* Handler: a struct that contains the (handler, data, deleter) tuple that is
- * used to register all handlers.  Users can Make() these directly but it's
- * more convenient to use the UpbMakeHandler/UpbBind macros above. */
-template <class T> class upb::Handler {
- public:
-  /* The underlying, handler function signature that upb uses internally. */
-  typedef T FuncPtr;
-
-  /* Intentionally implicit. */
-  template <class F> Handler(F func);
-  ~Handler() { UPB_ASSERT(registered_); }
-
-  void AddCleanup(upb_handlers* h) const;
-  FuncPtr handler() const { return handler_; }
-  const upb_handlerattr& attr() const { return attr_; }
-
- private:
-  Handler(const Handler&) = delete;
-  Handler& operator=(const Handler&) = delete;
-
-  FuncPtr handler_;
-  mutable upb_handlerattr attr_;
-  mutable bool registered_;
-  void *cleanup_data_;
-  upb_handlerfree *cleanup_func_;
+enum {
+  UPB_JSONDEC_IGNOREUNKNOWN = 1
 };
 
-/* A upb::Handlers object represents the set of handlers associated with a
- * message in the graph of messages.  You can think of it as a big virtual
- * table with functions corresponding to all the events that can fire while
- * parsing or visiting a message of a specific type.
- *
- * Any handlers that are not set behave as if they had successfully consumed
- * the value.  Any unset Start* handlers will propagate their closure to the
- * inner frame.
- *
- * The easiest way to create the *Handler objects needed by the Set* methods is
- * with the UpbBind() and UpbMakeHandler() macros; see below. */
-class upb::HandlersPtr {
- public:
-  HandlersPtr(upb_handlers* ptr) : ptr_(ptr) {}
-
-  upb_handlers* ptr() const { return ptr_; }
-
-  typedef upb_selector_t Selector;
-  typedef upb_handlertype_t Type;
-
-  typedef Handler<void *(*)(void *, const void *)> StartFieldHandler;
-  typedef Handler<bool (*)(void *, const void *)> EndFieldHandler;
-  typedef Handler<bool (*)(void *, const void *)> StartMessageHandler;
-  typedef Handler<bool (*)(void *, const void *, upb_status *)>
-      EndMessageHandler;
-  typedef Handler<void *(*)(void *, const void *, size_t)> StartStringHandler;
-  typedef Handler<size_t (*)(void *, const void *, const char *, size_t,
-                             const upb_bufhandle *)>
-      StringHandler;
-
-  template <class T> struct ValueHandler {
-    typedef Handler<bool(*)(void *, const void *, T)> H;
-  };
-
-  typedef ValueHandler<int32_t>::H     Int32Handler;
-  typedef ValueHandler<int64_t>::H     Int64Handler;
-  typedef ValueHandler<uint32_t>::H    UInt32Handler;
-  typedef ValueHandler<uint64_t>::H    UInt64Handler;
-  typedef ValueHandler<float>::H       FloatHandler;
-  typedef ValueHandler<double>::H      DoubleHandler;
-  typedef ValueHandler<bool>::H        BoolHandler;
-
-  /* Any function pointer can be converted to this and converted back to its
-   * correct type. */
-  typedef void GenericFunction();
-
-  typedef void HandlersCallback(const void *closure, upb_handlers *h);
-
-  /* Returns the msgdef associated with this handlers object. */
-  MessageDefPtr message_def() const {
-    return MessageDefPtr(upb_handlers_msgdef(ptr()));
-  }
-
-  /* Adds the given pointer and function to the list of cleanup functions that
-   * will be run when these handlers are freed.  If this pointer has previously
-   * been registered, the function returns false and does nothing. */
-  bool AddCleanup(void *ptr, upb_handlerfree *cleanup) {
-    return upb_handlers_addcleanup(ptr_, ptr, cleanup);
-  }
-
-  /* Sets the startmsg handler for the message, which is defined as follows:
-   *
-   *   bool startmsg(MyType* closure) {
-   *     // Called when the message begins.  Returns true if processing should
-   *     // continue.
-   *     return true;
-   *   }
-   */
-  bool SetStartMessageHandler(const StartMessageHandler &h) {
-    h.AddCleanup(ptr());
-    return upb_handlers_setstartmsg(ptr(), h.handler(), &h.attr());
-  }
-
-  /* Sets the endmsg handler for the message, which is defined as follows:
-   *
-   *   bool endmsg(MyType* closure, upb_status *status) {
-   *     // Called when processing of this message ends, whether in success or
-   *     // failure.  "status" indicates the final status of processing, and
-   *     // can also be modified in-place to update the final status.
-   *   }
-   */
-  bool SetEndMessageHandler(const EndMessageHandler& h) {
-    h.AddCleanup(ptr());
-    return upb_handlers_setendmsg(ptr(), h.handler(), &h.attr());
-  }
-
-  /* Sets the value handler for the given field, which is defined as follows
-   * (this is for an int32 field; other field types will pass their native
-   * C/C++ type for "val"):
-   *
-   *   bool OnValue(MyClosure* c, const MyHandlerData* d, int32_t val) {
-   *     // Called when the field's value is encountered.  "d" contains
-   *     // whatever data was bound to this field when it was registered.
-   *     // Returns true if processing should continue.
-   *     return true;
-   *   }
-   *
-   *   handers->SetInt32Handler(f, UpbBind(OnValue, new MyHandlerData(...)));
-   *
-   * The value type must exactly match f->type().
-   * For example, a handler that takes an int32_t parameter may only be used for
-   * fields of type UPB_TYPE_INT32 and UPB_TYPE_ENUM.
-   *
-   * Returns false if the handler failed to register; in this case the cleanup
-   * handler (if any) will be called immediately.
-   */
-  bool SetInt32Handler(FieldDefPtr f, const Int32Handler &h) {
-    h.AddCleanup(ptr());
-    return upb_handlers_setint32(ptr(), f.ptr(), h.handler(), &h.attr());
-  }
-
-  bool SetInt64Handler (FieldDefPtr f,  const Int64Handler& h) {
-    h.AddCleanup(ptr());
-    return upb_handlers_setint64(ptr(), f.ptr(), h.handler(), &h.attr());
-  }
-
-  bool SetUInt32Handler(FieldDefPtr f, const UInt32Handler& h) {
-    h.AddCleanup(ptr());
-    return upb_handlers_setuint32(ptr(), f.ptr(), h.handler(), &h.attr());
-  }
-
-  bool SetUInt64Handler(FieldDefPtr f, const UInt64Handler& h) {
-    h.AddCleanup(ptr());
-    return upb_handlers_setuint64(ptr(), f.ptr(), h.handler(), &h.attr());
-  }
-
-  bool SetFloatHandler (FieldDefPtr f,  const FloatHandler& h) {
-    h.AddCleanup(ptr());
-    return upb_handlers_setfloat(ptr(), f.ptr(), h.handler(), &h.attr());
-  }
-
-  bool SetDoubleHandler(FieldDefPtr f, const DoubleHandler& h) {
-    h.AddCleanup(ptr());
-    return upb_handlers_setdouble(ptr(), f.ptr(), h.handler(), &h.attr());
-  }
-
-  bool SetBoolHandler(FieldDefPtr f, const BoolHandler &h) {
-    h.AddCleanup(ptr());
-    return upb_handlers_setbool(ptr(), f.ptr(), h.handler(), &h.attr());
-  }
-
-  /* Like the previous, but templated on the type on the value (ie. int32).
-   * This is mostly useful to call from other templates.  To call this you must
-   * specify the template parameter explicitly, ie:
-   *   h->SetValueHandler<T>(f, UpbBind(MyHandler<T>, MyData)); */
-  template <class T>
-  bool SetValueHandler(
-      FieldDefPtr f,
-      const typename ValueHandler<typename CanonicalType<T>::Type>::H &handler);
-
-  /* Sets handlers for a string field, which are defined as follows:
-   *
-   *   MySubClosure* startstr(MyClosure* c, const MyHandlerData* d,
-   *                          size_t size_hint) {
-   *     // Called when a string value begins.  The return value indicates the
-   *     // closure for the string.  "size_hint" indicates the size of the
-   *     // string if it is known, however if the string is length-delimited
-   *     // and the end-of-string is not available size_hint will be zero.
-   *     // This case is indistinguishable from the case where the size is
-   *     // known to be zero.
-   *     //
-   *     // TODO(haberman): is it important to distinguish these cases?
-   *     // If we had ssize_t as a type we could make -1 "unknown", but
-   *     // ssize_t is POSIX (not ANSI) and therefore less portable.
-   *     // In practice I suspect it won't be important to distinguish.
-   *     return closure;
-   *   }
-   *
-   *   size_t str(MyClosure* closure, const MyHandlerData* d,
-   *              const char *str, size_t len) {
-   *     // Called for each buffer of string data; the multiple physical buffers
-   *     // are all part of the same logical string.  The return value indicates
-   *     // how many bytes were consumed.  If this number is less than "len",
-   *     // this will also indicate that processing should be halted for now,
-   *     // like returning false or UPB_BREAK from any other callback.  If
-   *     // number is greater than "len", the excess bytes will be skipped over
-   *     // and not passed to the callback.
-   *     return len;
-   *   }
-   *
-   *   bool endstr(MyClosure* c, const MyHandlerData* d) {
-   *     // Called when a string value ends.  Return value indicates whether
-   *     // processing should continue.
-   *     return true;
-   *   }
-   */
-  bool SetStartStringHandler(FieldDefPtr f, const StartStringHandler &h) {
-    h.AddCleanup(ptr());
-    return upb_handlers_setstartstr(ptr(), f.ptr(), h.handler(), &h.attr());
-  }
-
-  bool SetStringHandler(FieldDefPtr f, const StringHandler& h) {
-    h.AddCleanup(ptr());
-    return upb_handlers_setstring(ptr(), f.ptr(), h.handler(), &h.attr());
-  }
-
-  bool SetEndStringHandler(FieldDefPtr f, const EndFieldHandler& h) {
-    h.AddCleanup(ptr());
-    return upb_handlers_setendstr(ptr(), f.ptr(), h.handler(), &h.attr());
-  }
-
-  /* Sets the startseq handler, which is defined as follows:
-   *
-   *   MySubClosure *startseq(MyClosure* c, const MyHandlerData* d) {
-   *     // Called when a sequence (repeated field) begins.  The returned
-   *     // pointer indicates the closure for the sequence (or UPB_BREAK
-   *     // to interrupt processing).
-   *     return closure;
-   *   }
-   *
-   *   h->SetStartSequenceHandler(f, UpbBind(startseq, new MyHandlerData(...)));
-   *
-   * Returns "false" if "f" does not belong to this message or is not a
-   * repeated field.
-   */
-  bool SetStartSequenceHandler(FieldDefPtr f, const StartFieldHandler &h) {
-    h.AddCleanup(ptr());
-    return upb_handlers_setstartseq(ptr(), f.ptr(), h.handler(), &h.attr());
-  }
-
-  /* Sets the startsubmsg handler for the given field, which is defined as
-   * follows:
-   *
-   *   MySubClosure* startsubmsg(MyClosure* c, const MyHandlerData* d) {
-   *     // Called when a submessage begins.  The returned pointer indicates the
-   *     // closure for the sequence (or UPB_BREAK to interrupt processing).
-   *     return closure;
-   *   }
-   *
-   *   h->SetStartSubMessageHandler(f, UpbBind(startsubmsg,
-   *                                           new MyHandlerData(...)));
-   *
-   * Returns "false" if "f" does not belong to this message or is not a
-   * submessage/group field.
-   */
-  bool SetStartSubMessageHandler(FieldDefPtr f, const StartFieldHandler& h) {
-    h.AddCleanup(ptr());
-    return upb_handlers_setstartsubmsg(ptr(), f.ptr(), h.handler(), &h.attr());
-  }
-
-  /* Sets the endsubmsg handler for the given field, which is defined as
-   * follows:
-   *
-   *   bool endsubmsg(MyClosure* c, const MyHandlerData* d) {
-   *     // Called when a submessage ends.  Returns true to continue processing.
-   *     return true;
-   *   }
-   *
-   * Returns "false" if "f" does not belong to this message or is not a
-   * submessage/group field.
-   */
-  bool SetEndSubMessageHandler(FieldDefPtr f, const EndFieldHandler &h) {
-    h.AddCleanup(ptr());
-    return upb_handlers_setendsubmsg(ptr(), f.ptr(), h.handler(), &h.attr());
-  }
-
-  /* Starts the endsubseq handler for the given field, which is defined as
-   * follows:
-   *
-   *   bool endseq(MyClosure* c, const MyHandlerData* d) {
-   *     // Called when a sequence ends.  Returns true continue processing.
-   *     return true;
-   *   }
-   *
-   * Returns "false" if "f" does not belong to this message or is not a
-   * repeated field.
-   */
-  bool SetEndSequenceHandler(FieldDefPtr f, const EndFieldHandler &h) {
-    h.AddCleanup(ptr());
-    return upb_handlers_setendseq(ptr(), f.ptr(), h.handler(), &h.attr());
-  }
-
- private:
-  upb_handlers* ptr_;
-};
-
-#endif  /* __cplusplus */
-
-/* upb_handlercache ***********************************************************/
-
-/* A upb_handlercache lazily builds and caches upb_handlers.  You pass it a
- * function (with optional closure) that can build handlers for a given
- * message on-demand, and the cache maintains a map of msgdef->handlers. */
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-struct upb_handlercache;
-typedef struct upb_handlercache upb_handlercache;
-
-typedef void upb_handlers_callback(const void *closure, upb_handlers *h);
-
-upb_handlercache *upb_handlercache_new(upb_handlers_callback *callback,
-                                       const void *closure);
-void upb_handlercache_free(upb_handlercache *cache);
-const upb_handlers *upb_handlercache_get(upb_handlercache *cache,
-                                         const upb_msgdef *md);
-bool upb_handlercache_addcleanup(upb_handlercache *h, void *p,
-                                 upb_handlerfree *hfree);
-
-#ifdef __cplusplus
-}  /* extern "C" */
-
-class upb::HandlerCache {
- public:
-  HandlerCache(upb_handlers_callback *callback, const void *closure)
-      : ptr_(upb_handlercache_new(callback, closure), upb_handlercache_free) {}
-  HandlerCache(HandlerCache&&) = default;
-  HandlerCache& operator=(HandlerCache&&) = default;
-  HandlerCache(upb_handlercache* c) : ptr_(c, upb_handlercache_free) {}
-
-  upb_handlercache* ptr() { return ptr_.get(); }
-
-  const upb_handlers *Get(MessageDefPtr md) {
-    return upb_handlercache_get(ptr_.get(), md.ptr());
-  }
-
- private:
-  std::unique_ptr<upb_handlercache, decltype(&upb_handlercache_free)> ptr_;
-};
-
-#endif  /* __cplusplus */
-
-/* upb_byteshandler ***********************************************************/
-
-typedef struct {
-  upb_func *func;
-
-  /* It is wasteful to include the entire attributes here:
-   *
-   * * Some of the information is redundant (like storing the closure type
-   *   separately for each handler that must match).
-   * * Some of the info is only needed prior to freeze() (like closure types).
-   * * alignment padding wastes a lot of space for alwaysok_.
-   *
-   * If/when the size and locality of handlers is an issue, we can optimize this
-   * not to store the entire attr like this.  We do not expose the table's
-   * layout to allow this optimization in the future. */
-  upb_handlerattr attr;
-} upb_handlers_tabent;
-
-#define UPB_TABENT_INIT {NULL, UPB_HANDLERATTR_INIT}
-
-typedef struct {
-  upb_handlers_tabent table[3];
-} upb_byteshandler;
-
-#define UPB_BYTESHANDLER_INIT                             \
-  {                                                       \
-    { UPB_TABENT_INIT, UPB_TABENT_INIT, UPB_TABENT_INIT } \
-  }
-
-UPB_INLINE void upb_byteshandler_init(upb_byteshandler *handler) {
-  upb_byteshandler init = UPB_BYTESHANDLER_INIT;
-  *handler = init;
-}
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-/* Caller must ensure that "d" outlives the handlers. */
-bool upb_byteshandler_setstartstr(upb_byteshandler *h,
-                                  upb_startstr_handlerfunc *func, void *d);
-bool upb_byteshandler_setstring(upb_byteshandler *h,
-                                upb_string_handlerfunc *func, void *d);
-bool upb_byteshandler_setendstr(upb_byteshandler *h,
-                                upb_endfield_handlerfunc *func, void *d);
-
-#ifdef __cplusplus
-}  /* extern "C" */
-
-namespace upb {
-typedef upb_byteshandler BytesHandler;
-}
-#endif
-
-/** Message handlers ******************************************************************/
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-/* These are the handlers used internally by upb_msgfactory_getmergehandlers().
- * They write scalar data to a known offset from the message pointer.
- *
- * These would be trivial for anyone to implement themselves, but it's better
- * to use these because some JITs will recognize and specialize these instead
- * of actually calling the function. */
-
-/* Sets a handler for the given primitive field that will write the data at the
- * given offset.  If hasbit > 0, also sets a hasbit at the given bit offset
- * (addressing each byte low to high). */
-bool upb_msg_setscalarhandler(upb_handlers *h,
-                              const upb_fielddef *f,
-                              size_t offset,
-                              int32_t hasbit);
-
-/* If the given handler is a msghandlers_primitive field, returns true and sets
- * *type, *offset and *hasbit.  Otherwise returns false. */
-bool upb_msg_getscalarhandlerdata(const upb_handlers *h,
-                                  upb_selector_t s,
-                                  upb_fieldtype_t *type,
-                                  size_t *offset,
-                                  int32_t *hasbit);
-
-
+bool upb_json_decode(const char *buf, size_t size, upb_msg *msg,
+                     const upb_msgdef *m, const upb_symtab *any_pool,
+                     int options, upb_arena *arena, upb_status *status);
 
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif
 
+#endif  /* UPB_JSONDECODE_H_ */
 
-/*
-** Inline definitions for handlers.h, which are particularly long and a bit
-** tricky.
-*/
-
-#ifndef UPB_HANDLERS_INL_H_
-#define UPB_HANDLERS_INL_H_
-
-#include <limits.h>
-#include <stddef.h>
-
-
-#ifdef __cplusplus
-
-/* Type detection and typedefs for integer types.
- * For platforms where there are multiple 32-bit or 64-bit types, we need to be
- * able to enumerate them so we can properly create overloads for all variants.
- *
- * If any platform existed where there were three integer types with the same
- * size, this would have to become more complicated.  For example, short, int,
- * and long could all be 32-bits.  Even more diabolically, short, int, long,
- * and long long could all be 64 bits and still be standard-compliant.
- * However, few platforms are this strange, and it's unlikely that upb will be
- * used on the strangest ones. */
-
-/* Can't count on stdint.h limits like INT32_MAX, because in C++ these are
- * only defined when __STDC_LIMIT_MACROS are defined before the *first* include
- * of stdint.h.  We can't guarantee that someone else didn't include these first
- * without defining __STDC_LIMIT_MACROS. */
-#define UPB_INT32_MAX 0x7fffffffLL
-#define UPB_INT32_MIN (-UPB_INT32_MAX - 1)
-#define UPB_INT64_MAX 0x7fffffffffffffffLL
-#define UPB_INT64_MIN (-UPB_INT64_MAX - 1)
-
-#if INT_MAX == UPB_INT32_MAX && INT_MIN == UPB_INT32_MIN
-#define UPB_INT_IS_32BITS 1
-#endif
-
-#if LONG_MAX == UPB_INT32_MAX && LONG_MIN == UPB_INT32_MIN
-#define UPB_LONG_IS_32BITS 1
-#endif
-
-#if LONG_MAX == UPB_INT64_MAX && LONG_MIN == UPB_INT64_MIN
-#define UPB_LONG_IS_64BITS 1
-#endif
-
-#if LLONG_MAX == UPB_INT64_MAX && LLONG_MIN == UPB_INT64_MIN
-#define UPB_LLONG_IS_64BITS 1
-#endif
-
-/* We use macros instead of typedefs so we can undefine them later and avoid
- * leaking them outside this header file. */
-#if UPB_INT_IS_32BITS
-#define UPB_INT32_T int
-#define UPB_UINT32_T unsigned int
-
-#if UPB_LONG_IS_32BITS
-#define UPB_TWO_32BIT_TYPES 1
-#define UPB_INT32ALT_T long
-#define UPB_UINT32ALT_T unsigned long
-#endif  /* UPB_LONG_IS_32BITS */
-
-#elif UPB_LONG_IS_32BITS  /* && !UPB_INT_IS_32BITS */
-#define UPB_INT32_T long
-#define UPB_UINT32_T unsigned long
-#endif  /* UPB_INT_IS_32BITS */
-
-
-#if UPB_LONG_IS_64BITS
-#define UPB_INT64_T long
-#define UPB_UINT64_T unsigned long
-
-#if UPB_LLONG_IS_64BITS
-#define UPB_TWO_64BIT_TYPES 1
-#define UPB_INT64ALT_T long long
-#define UPB_UINT64ALT_T unsigned long long
-#endif  /* UPB_LLONG_IS_64BITS */
-
-#elif UPB_LLONG_IS_64BITS  /* && !UPB_LONG_IS_64BITS */
-#define UPB_INT64_T long long
-#define UPB_UINT64_T unsigned long long
-#endif  /* UPB_LONG_IS_64BITS */
-
-#undef UPB_INT32_MAX
-#undef UPB_INT32_MIN
-#undef UPB_INT64_MAX
-#undef UPB_INT64_MIN
-#undef UPB_INT_IS_32BITS
-#undef UPB_LONG_IS_32BITS
-#undef UPB_LONG_IS_64BITS
-#undef UPB_LLONG_IS_64BITS
-
-
-namespace upb {
-
-typedef void CleanupFunc(void *ptr);
-
-/* Template to remove "const" from "const T*" and just return "T*".
- *
- * We define a nonsense default because otherwise it will fail to instantiate as
- * a function parameter type even in cases where we don't expect any caller to
- * actually match the overload. */
-class CouldntRemoveConst {};
-template <class T> struct remove_constptr { typedef CouldntRemoveConst type; };
-template <class T> struct remove_constptr<const T *> { typedef T *type; };
-
-/* Template that we use below to remove a template specialization from
- * consideration if it matches a specific type. */
-template <class T, class U> struct disable_if_same { typedef void Type; };
-template <class T> struct disable_if_same<T, T> {};
-
-template <class T> void DeletePointer(void *p) { delete static_cast<T>(p); }
-
-template <class T1, class T2>
-struct FirstUnlessVoidOrBool {
-  typedef T1 value;
-};
-
-template <class T2>
-struct FirstUnlessVoidOrBool<void, T2> {
-  typedef T2 value;
-};
-
-template <class T2>
-struct FirstUnlessVoidOrBool<bool, T2> {
-  typedef T2 value;
-};
-
-template<class T, class U>
-struct is_same {
-  static bool value;
-};
-
-template<class T>
-struct is_same<T, T> {
-  static bool value;
-};
-
-template<class T, class U>
-bool is_same<T, U>::value = false;
-
-template<class T>
-bool is_same<T, T>::value = true;
-
-/* FuncInfo *******************************************************************/
-
-/* Info about the user's original, pre-wrapped function. */
-template <class C, class R = void>
-struct FuncInfo {
-  /* The type of the closure that the function takes (its first param). */
-  typedef C Closure;
-
-  /* The return type. */
-  typedef R Return;
-};
-
-/* Func ***********************************************************************/
-
-/* Func1, Func2, Func3: Template classes representing a function and its
- * signature.
- *
- * Since the function is a template parameter, calling the function can be
- * inlined at compile-time and does not require a function pointer at runtime.
- * These functions are not bound to a handler data so have no data or cleanup
- * handler. */
-struct UnboundFunc {
-  CleanupFunc *GetCleanup() { return nullptr; }
-  void *GetData() { return nullptr; }
-};
-
-template <class R, class P1, R F(P1), class I>
-struct Func1 : public UnboundFunc {
-  typedef R Return;
-  typedef I FuncInfo;
-  static R Call(P1 p1) { return F(p1); }
-};
-
-template <class R, class P1, class P2, R F(P1, P2), class I>
-struct Func2 : public UnboundFunc {
-  typedef R Return;
-  typedef I FuncInfo;
-  static R Call(P1 p1, P2 p2) { return F(p1, p2); }
-};
-
-template <class R, class P1, class P2, class P3, R F(P1, P2, P3), class I>
-struct Func3 : public UnboundFunc {
-  typedef R Return;
-  typedef I FuncInfo;
-  static R Call(P1 p1, P2 p2, P3 p3) { return F(p1, p2, p3); }
-};
-
-template <class R, class P1, class P2, class P3, class P4, R F(P1, P2, P3, P4),
-          class I>
-struct Func4 : public UnboundFunc {
-  typedef R Return;
-  typedef I FuncInfo;
-  static R Call(P1 p1, P2 p2, P3 p3, P4 p4) { return F(p1, p2, p3, p4); }
-};
-
-template <class R, class P1, class P2, class P3, class P4, class P5,
-          R F(P1, P2, P3, P4, P5), class I>
-struct Func5 : public UnboundFunc {
-  typedef R Return;
-  typedef I FuncInfo;
-  static R Call(P1 p1, P2 p2, P3 p3, P4 p4, P5 p5) {
-    return F(p1, p2, p3, p4, p5);
-  }
-};
-
-/* BoundFunc ******************************************************************/
-
-/* BoundFunc2, BoundFunc3: Like Func2/Func3 except also contains a value that
- * shall be bound to the function's second parameter.
- * 
- * Note that the second parameter is a const pointer, but our stored bound value
- * is non-const so we can free it when the handlers are destroyed. */
-template <class T>
-struct BoundFunc {
-  typedef typename remove_constptr<T>::type MutableP2;
-  explicit BoundFunc(MutableP2 data_) : data(data_) {}
-  CleanupFunc *GetCleanup() { return &DeletePointer<MutableP2>; }
-  MutableP2 GetData() { return data; }
-  MutableP2 data;
-};
-
-template <class R, class P1, class P2, R F(P1, P2), class I>
-struct BoundFunc2 : public BoundFunc<P2> {
-  typedef BoundFunc<P2> Base;
-  typedef I FuncInfo;
-  explicit BoundFunc2(typename Base::MutableP2 arg) : Base(arg) {}
-};
-
-template <class R, class P1, class P2, class P3, R F(P1, P2, P3), class I>
-struct BoundFunc3 : public BoundFunc<P2> {
-  typedef BoundFunc<P2> Base;
-  typedef I FuncInfo;
-  explicit BoundFunc3(typename Base::MutableP2 arg) : Base(arg) {}
-};
-
-template <class R, class P1, class P2, class P3, class P4, R F(P1, P2, P3, P4),
-          class I>
-struct BoundFunc4 : public BoundFunc<P2> {
-  typedef BoundFunc<P2> Base;
-  typedef I FuncInfo;
-  explicit BoundFunc4(typename Base::MutableP2 arg) : Base(arg) {}
-};
-
-template <class R, class P1, class P2, class P3, class P4, class P5,
-          R F(P1, P2, P3, P4, P5), class I>
-struct BoundFunc5 : public BoundFunc<P2> {
-  typedef BoundFunc<P2> Base;
-  typedef I FuncInfo;
-  explicit BoundFunc5(typename Base::MutableP2 arg) : Base(arg) {}
-};
-
-/* FuncSig ********************************************************************/
-
-/* FuncSig1, FuncSig2, FuncSig3: template classes reflecting a function
- * *signature*, but without a specific function attached.
- *
- * These classes contain member functions that can be invoked with a
- * specific function to return a Func/BoundFunc class. */
-template <class R, class P1>
-struct FuncSig1 {
-  template <R F(P1)>
-  Func1<R, P1, F, FuncInfo<P1, R> > GetFunc() {
-    return Func1<R, P1, F, FuncInfo<P1, R> >();
-  }
-};
-
-template <class R, class P1, class P2>
-struct FuncSig2 {
-  template <R F(P1, P2)>
-  Func2<R, P1, P2, F, FuncInfo<P1, R> > GetFunc() {
-    return Func2<R, P1, P2, F, FuncInfo<P1, R> >();
-  }
-
-  template <R F(P1, P2)>
-  BoundFunc2<R, P1, P2, F, FuncInfo<P1, R> > GetFunc(
-      typename remove_constptr<P2>::type param2) {
-    return BoundFunc2<R, P1, P2, F, FuncInfo<P1, R> >(param2);
-  }
-};
-
-template <class R, class P1, class P2, class P3>
-struct FuncSig3 {
-  template <R F(P1, P2, P3)>
-  Func3<R, P1, P2, P3, F, FuncInfo<P1, R> > GetFunc() {
-    return Func3<R, P1, P2, P3, F, FuncInfo<P1, R> >();
-  }
-
-  template <R F(P1, P2, P3)>
-  BoundFunc3<R, P1, P2, P3, F, FuncInfo<P1, R> > GetFunc(
-      typename remove_constptr<P2>::type param2) {
-    return BoundFunc3<R, P1, P2, P3, F, FuncInfo<P1, R> >(param2);
-  }
-};
-
-template <class R, class P1, class P2, class P3, class P4>
-struct FuncSig4 {
-  template <R F(P1, P2, P3, P4)>
-  Func4<R, P1, P2, P3, P4, F, FuncInfo<P1, R> > GetFunc() {
-    return Func4<R, P1, P2, P3, P4, F, FuncInfo<P1, R> >();
-  }
-
-  template <R F(P1, P2, P3, P4)>
-  BoundFunc4<R, P1, P2, P3, P4, F, FuncInfo<P1, R> > GetFunc(
-      typename remove_constptr<P2>::type param2) {
-    return BoundFunc4<R, P1, P2, P3, P4, F, FuncInfo<P1, R> >(param2);
-  }
-};
-
-template <class R, class P1, class P2, class P3, class P4, class P5>
-struct FuncSig5 {
-  template <R F(P1, P2, P3, P4, P5)>
-  Func5<R, P1, P2, P3, P4, P5, F, FuncInfo<P1, R> > GetFunc() {
-    return Func5<R, P1, P2, P3, P4, P5, F, FuncInfo<P1, R> >();
-  }
-
-  template <R F(P1, P2, P3, P4, P5)>
-  BoundFunc5<R, P1, P2, P3, P4, P5, F, FuncInfo<P1, R> > GetFunc(
-      typename remove_constptr<P2>::type param2) {
-    return BoundFunc5<R, P1, P2, P3, P4, P5, F, FuncInfo<P1, R> >(param2);
-  }
-};
-
-/* Overloaded template function that can construct the appropriate FuncSig*
- * class given a function pointer by deducing the template parameters. */
-template <class R, class P1>
-inline FuncSig1<R, P1> MatchFunc(R (*f)(P1)) {
-  UPB_UNUSED(f);  /* Only used for template parameter deduction. */
-  return FuncSig1<R, P1>();
-}
-
-template <class R, class P1, class P2>
-inline FuncSig2<R, P1, P2> MatchFunc(R (*f)(P1, P2)) {
-  UPB_UNUSED(f);  /* Only used for template parameter deduction. */
-  return FuncSig2<R, P1, P2>();
-}
-
-template <class R, class P1, class P2, class P3>
-inline FuncSig3<R, P1, P2, P3> MatchFunc(R (*f)(P1, P2, P3)) {
-  UPB_UNUSED(f);  /* Only used for template parameter deduction. */
-  return FuncSig3<R, P1, P2, P3>();
-}
-
-template <class R, class P1, class P2, class P3, class P4>
-inline FuncSig4<R, P1, P2, P3, P4> MatchFunc(R (*f)(P1, P2, P3, P4)) {
-  UPB_UNUSED(f);  /* Only used for template parameter deduction. */
-  return FuncSig4<R, P1, P2, P3, P4>();
-}
-
-template <class R, class P1, class P2, class P3, class P4, class P5>
-inline FuncSig5<R, P1, P2, P3, P4, P5> MatchFunc(R (*f)(P1, P2, P3, P4, P5)) {
-  UPB_UNUSED(f);  /* Only used for template parameter deduction. */
-  return FuncSig5<R, P1, P2, P3, P4, P5>();
-}
-
-/* MethodSig ******************************************************************/
-
-/* CallMethod*: a function template that calls a given method. */
-template <class R, class C, R (C::*F)()>
-R CallMethod0(C *obj) {
-  return ((*obj).*F)();
-}
-
-template <class R, class C, class P1, R (C::*F)(P1)>
-R CallMethod1(C *obj, P1 arg1) {
-  return ((*obj).*F)(arg1);
-}
-
-template <class R, class C, class P1, class P2, R (C::*F)(P1, P2)>
-R CallMethod2(C *obj, P1 arg1, P2 arg2) {
-  return ((*obj).*F)(arg1, arg2);
-}
-
-template <class R, class C, class P1, class P2, class P3, R (C::*F)(P1, P2, P3)>
-R CallMethod3(C *obj, P1 arg1, P2 arg2, P3 arg3) {
-  return ((*obj).*F)(arg1, arg2, arg3);
-}
-
-template <class R, class C, class P1, class P2, class P3, class P4,
-          R (C::*F)(P1, P2, P3, P4)>
-R CallMethod4(C *obj, P1 arg1, P2 arg2, P3 arg3, P4 arg4) {
-  return ((*obj).*F)(arg1, arg2, arg3, arg4);
-}
-
-/* MethodSig: like FuncSig, but for member functions.
- *
- * GetFunc() returns a normal FuncN object, so after calling GetFunc() no
- * more logic is required to special-case methods. */
-template <class R, class C>
-struct MethodSig0 {
-  template <R (C::*F)()>
-  Func1<R, C *, CallMethod0<R, C, F>, FuncInfo<C *, R> > GetFunc() {
-    return Func1<R, C *, CallMethod0<R, C, F>, FuncInfo<C *, R> >();
-  }
-};
-
-template <class R, class C, class P1>
-struct MethodSig1 {
-  template <R (C::*F)(P1)>
-  Func2<R, C *, P1, CallMethod1<R, C, P1, F>, FuncInfo<C *, R> > GetFunc() {
-    return Func2<R, C *, P1, CallMethod1<R, C, P1, F>, FuncInfo<C *, R> >();
-  }
-
-  template <R (C::*F)(P1)>
-  BoundFunc2<R, C *, P1, CallMethod1<R, C, P1, F>, FuncInfo<C *, R> > GetFunc(
-      typename remove_constptr<P1>::type param1) {
-    return BoundFunc2<R, C *, P1, CallMethod1<R, C, P1, F>, FuncInfo<C *, R> >(
-        param1);
-  }
-};
-
-template <class R, class C, class P1, class P2>
-struct MethodSig2 {
-  template <R (C::*F)(P1, P2)>
-  Func3<R, C *, P1, P2, CallMethod2<R, C, P1, P2, F>, FuncInfo<C *, R> >
-  GetFunc() {
-    return Func3<R, C *, P1, P2, CallMethod2<R, C, P1, P2, F>,
-                 FuncInfo<C *, R> >();
-  }
-
-  template <R (C::*F)(P1, P2)>
-  BoundFunc3<R, C *, P1, P2, CallMethod2<R, C, P1, P2, F>, FuncInfo<C *, R> >
-  GetFunc(typename remove_constptr<P1>::type param1) {
-    return BoundFunc3<R, C *, P1, P2, CallMethod2<R, C, P1, P2, F>,
-                      FuncInfo<C *, R> >(param1);
-  }
-};
-
-template <class R, class C, class P1, class P2, class P3>
-struct MethodSig3 {
-  template <R (C::*F)(P1, P2, P3)>
-  Func4<R, C *, P1, P2, P3, CallMethod3<R, C, P1, P2, P3, F>, FuncInfo<C *, R> >
-  GetFunc() {
-    return Func4<R, C *, P1, P2, P3, CallMethod3<R, C, P1, P2, P3, F>,
-                 FuncInfo<C *, R> >();
-  }
-
-  template <R (C::*F)(P1, P2, P3)>
-  BoundFunc4<R, C *, P1, P2, P3, CallMethod3<R, C, P1, P2, P3, F>,
-             FuncInfo<C *, R> >
-  GetFunc(typename remove_constptr<P1>::type param1) {
-    return BoundFunc4<R, C *, P1, P2, P3, CallMethod3<R, C, P1, P2, P3, F>,
-                      FuncInfo<C *, R> >(param1);
-  }
-};
-
-template <class R, class C, class P1, class P2, class P3, class P4>
-struct MethodSig4 {
-  template <R (C::*F)(P1, P2, P3, P4)>
-  Func5<R, C *, P1, P2, P3, P4, CallMethod4<R, C, P1, P2, P3, P4, F>,
-        FuncInfo<C *, R> >
-  GetFunc() {
-    return Func5<R, C *, P1, P2, P3, P4, CallMethod4<R, C, P1, P2, P3, P4, F>,
-                 FuncInfo<C *, R> >();
-  }
-
-  template <R (C::*F)(P1, P2, P3, P4)>
-  BoundFunc5<R, C *, P1, P2, P3, P4, CallMethod4<R, C, P1, P2, P3, P4, F>,
-             FuncInfo<C *, R> >
-  GetFunc(typename remove_constptr<P1>::type param1) {
-    return BoundFunc5<R, C *, P1, P2, P3, P4,
-                      CallMethod4<R, C, P1, P2, P3, P4, F>, FuncInfo<C *, R> >(
-        param1);
-  }
-};
-
-template <class R, class C>
-inline MethodSig0<R, C> MatchFunc(R (C::*f)()) {
-  UPB_UNUSED(f);  /* Only used for template parameter deduction. */
-  return MethodSig0<R, C>();
-}
-
-template <class R, class C, class P1>
-inline MethodSig1<R, C, P1> MatchFunc(R (C::*f)(P1)) {
-  UPB_UNUSED(f);  /* Only used for template parameter deduction. */
-  return MethodSig1<R, C, P1>();
-}
-
-template <class R, class C, class P1, class P2>
-inline MethodSig2<R, C, P1, P2> MatchFunc(R (C::*f)(P1, P2)) {
-  UPB_UNUSED(f);  /* Only used for template parameter deduction. */
-  return MethodSig2<R, C, P1, P2>();
-}
-
-template <class R, class C, class P1, class P2, class P3>
-inline MethodSig3<R, C, P1, P2, P3> MatchFunc(R (C::*f)(P1, P2, P3)) {
-  UPB_UNUSED(f);  /* Only used for template parameter deduction. */
-  return MethodSig3<R, C, P1, P2, P3>();
-}
-
-template <class R, class C, class P1, class P2, class P3, class P4>
-inline MethodSig4<R, C, P1, P2, P3, P4> MatchFunc(R (C::*f)(P1, P2, P3, P4)) {
-  UPB_UNUSED(f);  /* Only used for template parameter deduction. */
-  return MethodSig4<R, C, P1, P2, P3, P4>();
-}
-
-/* MaybeWrapReturn ************************************************************/
-
-/* Template class that attempts to wrap the return value of the function so it
- * matches the expected type.  There are two main adjustments it may make:
- *
- *   1. If the function returns void, make it return the expected type and with
- *      a value that always indicates success.
- *   2. If the function returns bool, make it return the expected type with a
- *      value that indicates success or failure.
- *
- * The "expected type" for return is:
- *   1. void* for start handlers.  If the closure parameter has a different type
- *      we will cast it to void* for the return in the success case.
- *   2. size_t for string buffer handlers.
- *   3. bool for everything else. */
-
-/* Template parameters are FuncN type and desired return type. */
-template <class F, class R, class Enable = void>
-struct MaybeWrapReturn;
-
-/* If the return type matches, return the given function unwrapped. */
-template <class F>
-struct MaybeWrapReturn<F, typename F::Return> {
-  typedef F Func;
-};
-
-/* Function wrapper that munges the return value from void to (bool)true. */
-template <class P1, class P2, void F(P1, P2)>
-bool ReturnTrue2(P1 p1, P2 p2) {
-  F(p1, p2);
-  return true;
-}
-
-template <class P1, class P2, class P3, void F(P1, P2, P3)>
-bool ReturnTrue3(P1 p1, P2 p2, P3 p3) {
-  F(p1, p2, p3);
-  return true;
-}
-
-/* Function wrapper that munges the return value from void to (void*)arg1  */
-template <class P1, class P2, void F(P1, P2)>
-void *ReturnClosure2(P1 p1, P2 p2) {
-  F(p1, p2);
-  return p1;
-}
-
-template <class P1, class P2, class P3, void F(P1, P2, P3)>
-void *ReturnClosure3(P1 p1, P2 p2, P3 p3) {
-  F(p1, p2, p3);
-  return p1;
-}
-
-/* Function wrapper that munges the return value from R to void*. */
-template <class R, class P1, class P2, R F(P1, P2)>
-void *CastReturnToVoidPtr2(P1 p1, P2 p2) {
-  return F(p1, p2);
-}
-
-template <class R, class P1, class P2, class P3, R F(P1, P2, P3)>
-void *CastReturnToVoidPtr3(P1 p1, P2 p2, P3 p3) {
-  return F(p1, p2, p3);
-}
-
-/* Function wrapper that munges the return value from bool to void*. */
-template <class P1, class P2, bool F(P1, P2)>
-void *ReturnClosureOrBreak2(P1 p1, P2 p2) {
-  return F(p1, p2) ? p1 : UPB_BREAK;
-}
-
-template <class P1, class P2, class P3, bool F(P1, P2, P3)>
-void *ReturnClosureOrBreak3(P1 p1, P2 p2, P3 p3) {
-  return F(p1, p2, p3) ? p1 : UPB_BREAK;
-}
-
-/* For the string callback, which takes five params, returns the size param. */
-template <class P1, class P2,
-          void F(P1, P2, const char *, size_t, const upb_bufhandle *)>
-size_t ReturnStringLen(P1 p1, P2 p2, const char *p3, size_t p4,
-                       const upb_bufhandle *p5) {
-  F(p1, p2, p3, p4, p5);
-  return p4;
-}
-
-/* For the string callback, which takes five params, returns the size param or
- * zero. */
-template <class P1, class P2,
-          bool F(P1, P2, const char *, size_t, const upb_bufhandle *)>
-size_t ReturnNOr0(P1 p1, P2 p2, const char *p3, size_t p4,
-                  const upb_bufhandle *p5) {
-  return F(p1, p2, p3, p4, p5) ? p4 : 0;
-}
-
-/* If we have a function returning void but want a function returning bool, wrap
- * it in a function that returns true. */
-template <class P1, class P2, void F(P1, P2), class I>
-struct MaybeWrapReturn<Func2<void, P1, P2, F, I>, bool> {
-  typedef Func2<bool, P1, P2, ReturnTrue2<P1, P2, F>, I> Func;
-};
-
-template <class P1, class P2, class P3, void F(P1, P2, P3), class I>
-struct MaybeWrapReturn<Func3<void, P1, P2, P3, F, I>, bool> {
-  typedef Func3<bool, P1, P2, P3, ReturnTrue3<P1, P2, P3, F>, I> Func;
-};
-
-/* If our function returns void but we want one returning void*, wrap it in a
- * function that returns the first argument. */
-template <class P1, class P2, void F(P1, P2), class I>
-struct MaybeWrapReturn<Func2<void, P1, P2, F, I>, void *> {
-  typedef Func2<void *, P1, P2, ReturnClosure2<P1, P2, F>, I> Func;
-};
-
-template <class P1, class P2, class P3, void F(P1, P2, P3), class I>
-struct MaybeWrapReturn<Func3<void, P1, P2, P3, F, I>, void *> {
-  typedef Func3<void *, P1, P2, P3, ReturnClosure3<P1, P2, P3, F>, I> Func;
-};
-
-/* If our function returns R* but we want one returning void*, wrap it in a
- * function that casts to void*. */
-template <class R, class P1, class P2, R *F(P1, P2), class I>
-struct MaybeWrapReturn<Func2<R *, P1, P2, F, I>, void *,
-                       typename disable_if_same<R *, void *>::Type> {
-  typedef Func2<void *, P1, P2, CastReturnToVoidPtr2<R *, P1, P2, F>, I> Func;
-};
-
-template <class R, class P1, class P2, class P3, R *F(P1, P2, P3), class I>
-struct MaybeWrapReturn<Func3<R *, P1, P2, P3, F, I>, void *,
-                       typename disable_if_same<R *, void *>::Type> {
-  typedef Func3<void *, P1, P2, P3, CastReturnToVoidPtr3<R *, P1, P2, P3, F>, I>
-      Func;
-};
-
-/* If our function returns bool but we want one returning void*, wrap it in a
- * function that returns either the first param or UPB_BREAK. */
-template <class P1, class P2, bool F(P1, P2), class I>
-struct MaybeWrapReturn<Func2<bool, P1, P2, F, I>, void *> {
-  typedef Func2<void *, P1, P2, ReturnClosureOrBreak2<P1, P2, F>, I> Func;
-};
-
-template <class P1, class P2, class P3, bool F(P1, P2, P3), class I>
-struct MaybeWrapReturn<Func3<bool, P1, P2, P3, F, I>, void *> {
-  typedef Func3<void *, P1, P2, P3, ReturnClosureOrBreak3<P1, P2, P3, F>, I>
-      Func;
-};
-
-/* If our function returns void but we want one returning size_t, wrap it in a
- * function that returns the size argument. */
-template <class P1, class P2,
-          void F(P1, P2, const char *, size_t, const upb_bufhandle *), class I>
-struct MaybeWrapReturn<
-    Func5<void, P1, P2, const char *, size_t, const upb_bufhandle *, F, I>,
-          size_t> {
-  typedef Func5<size_t, P1, P2, const char *, size_t, const upb_bufhandle *,
-                ReturnStringLen<P1, P2, F>, I> Func;
-};
-
-/* If our function returns bool but we want one returning size_t, wrap it in a
- * function that returns either 0 or the buf size. */
-template <class P1, class P2,
-          bool F(P1, P2, const char *, size_t, const upb_bufhandle *), class I>
-struct MaybeWrapReturn<
-    Func5<bool, P1, P2, const char *, size_t, const upb_bufhandle *, F, I>,
-    size_t> {
-  typedef Func5<size_t, P1, P2, const char *, size_t, const upb_bufhandle *,
-                ReturnNOr0<P1, P2, F>, I> Func;
-};
-
-/* ConvertParams **************************************************************/
-
-/* Template class that converts the function parameters if necessary, and
- * ignores the HandlerData parameter if appropriate.
- *
- * Template parameter is the are FuncN function type. */
-template <class F, class T>
-struct ConvertParams;
-
-/* Function that discards the handler data parameter. */
-template <class R, class P1, R F(P1)>
-R IgnoreHandlerData2(void *p1, const void *hd) {
-  UPB_UNUSED(hd);
-  return F(static_cast<P1>(p1));
-}
-
-template <class R, class P1, class P2Wrapper, class P2Wrapped,
-          R F(P1, P2Wrapped)>
-R IgnoreHandlerData3(void *p1, const void *hd, P2Wrapper p2) {
-  UPB_UNUSED(hd);
-  return F(static_cast<P1>(p1), p2);
-}
-
-template <class R, class P1, class P2, class P3, R F(P1, P2, P3)>
-R IgnoreHandlerData4(void *p1, const void *hd, P2 p2, P3 p3) {
-  UPB_UNUSED(hd);
-  return F(static_cast<P1>(p1), p2, p3);
-}
-
-template <class R, class P1, class P2, class P3, class P4, R F(P1, P2, P3, P4)>
-R IgnoreHandlerData5(void *p1, const void *hd, P2 p2, P3 p3, P4 p4) {
-  UPB_UNUSED(hd);
-  return F(static_cast<P1>(p1), p2, p3, p4);
-}
-
-template <class R, class P1, R F(P1, const char*, size_t)>
-R IgnoreHandlerDataIgnoreHandle(void *p1, const void *hd, const char *p2,
-                                size_t p3, const upb_bufhandle *handle) {
-  UPB_UNUSED(hd);
-  UPB_UNUSED(handle);
-  return F(static_cast<P1>(p1), p2, p3);
-}
-
-/* Function that casts the handler data parameter. */
-template <class R, class P1, class P2, R F(P1, P2)>
-R CastHandlerData2(void *c, const void *hd) {
-  return F(static_cast<P1>(c), static_cast<P2>(hd));
-}
-
-template <class R, class P1, class P2, class P3Wrapper, class P3Wrapped,
-          R F(P1, P2, P3Wrapped)>
-R CastHandlerData3(void *c, const void *hd, P3Wrapper p3) {
-  return F(static_cast<P1>(c), static_cast<P2>(hd), p3);
-}
-
-template <class R, class P1, class P2, class P3, class P4, class P5,
-          R F(P1, P2, P3, P4, P5)>
-R CastHandlerData5(void *c, const void *hd, P3 p3, P4 p4, P5 p5) {
-  return F(static_cast<P1>(c), static_cast<P2>(hd), p3, p4, p5);
-}
-
-template <class R, class P1, class P2, R F(P1, P2, const char *, size_t)>
-R CastHandlerDataIgnoreHandle(void *c, const void *hd, const char *p3,
-                              size_t p4, const upb_bufhandle *handle) {
-  UPB_UNUSED(handle);
-  return F(static_cast<P1>(c), static_cast<P2>(hd), p3, p4);
-}
-
-/* For unbound functions, ignore the handler data. */
-template <class R, class P1, R F(P1), class I, class T>
-struct ConvertParams<Func1<R, P1, F, I>, T> {
-  typedef Func2<R, void *, const void *, IgnoreHandlerData2<R, P1, F>, I> Func;
-};
-
-template <class R, class P1, class P2, R F(P1, P2), class I,
-          class R2, class P1_2, class P2_2, class P3_2>
-struct ConvertParams<Func2<R, P1, P2, F, I>,
-                     R2 (*)(P1_2, P2_2, P3_2)> {
-  typedef Func3<R, void *, const void *, P3_2,
-                IgnoreHandlerData3<R, P1, P3_2, P2, F>, I> Func;
-};
-
-/* For StringBuffer only; this ignores both the handler data and the
- * upb_bufhandle. */
-template <class R, class P1, R F(P1, const char *, size_t), class I, class T>
-struct ConvertParams<Func3<R, P1, const char *, size_t, F, I>, T> {
-  typedef Func5<R, void *, const void *, const char *, size_t,
-                const upb_bufhandle *, IgnoreHandlerDataIgnoreHandle<R, P1, F>,
-                I> Func;
-};
-
-template <class R, class P1, class P2, class P3, class P4, R F(P1, P2, P3, P4),
-          class I, class T>
-struct ConvertParams<Func4<R, P1, P2, P3, P4, F, I>, T> {
-  typedef Func5<R, void *, const void *, P2, P3, P4,
-                IgnoreHandlerData5<R, P1, P2, P3, P4, F>, I> Func;
-};
-
-/* For bound functions, cast the handler data. */
-template <class R, class P1, class P2, R F(P1, P2), class I, class T>
-struct ConvertParams<BoundFunc2<R, P1, P2, F, I>, T> {
-  typedef Func2<R, void *, const void *, CastHandlerData2<R, P1, P2, F>, I>
-      Func;
-};
-
-template <class R, class P1, class P2, class P3, R F(P1, P2, P3), class I,
-          class R2, class P1_2, class P2_2, class P3_2>
-struct ConvertParams<BoundFunc3<R, P1, P2, P3, F, I>,
-                     R2 (*)(P1_2, P2_2, P3_2)> {
-  typedef Func3<R, void *, const void *, P3_2,
-                CastHandlerData3<R, P1, P2, P3_2, P3, F>, I> Func;
-};
-
-/* For StringBuffer only; this ignores the upb_bufhandle. */
-template <class R, class P1, class P2, R F(P1, P2, const char *, size_t),
-          class I, class T>
-struct ConvertParams<BoundFunc4<R, P1, P2, const char *, size_t, F, I>, T> {
-  typedef Func5<R, void *, const void *, const char *, size_t,
-                const upb_bufhandle *,
-                CastHandlerDataIgnoreHandle<R, P1, P2, F>, I>
-      Func;
-};
-
-template <class R, class P1, class P2, class P3, class P4, class P5,
-          R F(P1, P2, P3, P4, P5), class I, class T>
-struct ConvertParams<BoundFunc5<R, P1, P2, P3, P4, P5, F, I>, T> {
-  typedef Func5<R, void *, const void *, P3, P4, P5,
-                CastHandlerData5<R, P1, P2, P3, P4, P5, F>, I> Func;
-};
-
-/* utype/ltype are upper/lower-case, ctype is canonical C type, vtype is
- * variant C type. */
-#define TYPE_METHODS(utype, ltype, ctype, vtype)                      \
-  template <>                                                         \
-  struct CanonicalType<vtype> {                                       \
-    typedef ctype Type;                                               \
-  };                                                                  \
-  template <>                                                         \
-  inline bool HandlersPtr::SetValueHandler<vtype>(                    \
-      FieldDefPtr f, const HandlersPtr::utype##Handler &handler) {    \
-    handler.AddCleanup(ptr());                                        \
-    return upb_handlers_set##ltype(ptr(), f.ptr(), handler.handler(), \
-                                   &handler.attr());                  \
-  }
-
-TYPE_METHODS(Double, double, double,   double)
-TYPE_METHODS(Float,  float,  float,    float)
-TYPE_METHODS(UInt64, uint64, uint64_t, UPB_UINT64_T)
-TYPE_METHODS(UInt32, uint32, uint32_t, UPB_UINT32_T)
-TYPE_METHODS(Int64,  int64,  int64_t,  UPB_INT64_T)
-TYPE_METHODS(Int32,  int32,  int32_t,  UPB_INT32_T)
-TYPE_METHODS(Bool,   bool,   bool,     bool)
-
-#ifdef UPB_TWO_32BIT_TYPES
-TYPE_METHODS(Int32,  int32,  int32_t,  UPB_INT32ALT_T)
-TYPE_METHODS(UInt32, uint32, uint32_t, UPB_UINT32ALT_T)
-#endif
-
-#ifdef UPB_TWO_64BIT_TYPES
-TYPE_METHODS(Int64,  int64,  int64_t,  UPB_INT64ALT_T)
-TYPE_METHODS(UInt64, uint64, uint64_t, UPB_UINT64ALT_T)
-#endif
-#undef TYPE_METHODS
-
-template <> struct CanonicalType<Status*> {
-  typedef Status* Type;
-};
-
-template <class F> struct ReturnOf;
-
-template <class R, class P1, class P2>
-struct ReturnOf<R (*)(P1, P2)> {
-  typedef R Return;
-};
-
-template <class R, class P1, class P2, class P3>
-struct ReturnOf<R (*)(P1, P2, P3)> {
-  typedef R Return;
-};
-
-template <class R, class P1, class P2, class P3, class P4>
-struct ReturnOf<R (*)(P1, P2, P3, P4)> {
-  typedef R Return;
-};
-
-template <class R, class P1, class P2, class P3, class P4, class P5>
-struct ReturnOf<R (*)(P1, P2, P3, P4, P5)> {
-  typedef R Return;
-};
-
-
-template <class T>
-template <class F>
-inline Handler<T>::Handler(F func)
-    : registered_(false),
-      cleanup_data_(func.GetData()),
-      cleanup_func_(func.GetCleanup()) {
-  attr_.handler_data = func.GetData();
-  typedef typename ReturnOf<T>::Return Return;
-  typedef typename ConvertParams<F, T>::Func ConvertedParamsFunc;
-  typedef typename MaybeWrapReturn<ConvertedParamsFunc, Return>::Func
-      ReturnWrappedFunc;
-  handler_ = ReturnWrappedFunc().Call;
-
-  /* Set attributes based on what templates can statically tell us about the
-   * user's function. */
-
-  /* If the original function returns void, then we know that we wrapped it to
-   * always return ok. */
-  bool always_ok = is_same<typename F::FuncInfo::Return, void>::value;
-  attr_.alwaysok = always_ok;
-
-  /* Closure parameter and return type. */
-  attr_.closure_type = UniquePtrForType<typename F::FuncInfo::Closure>();
-
-  /* We use the closure type (from the first parameter) if the return type is
-   * void or bool, since these are the two cases we wrap to return the closure's
-   * type anyway.
-   *
-   * This is all nonsense for non START* handlers, but it doesn't matter because
-   * in that case the value will be ignored. */
-  typedef typename FirstUnlessVoidOrBool<typename F::FuncInfo::Return,
-                                         typename F::FuncInfo::Closure>::value
-      EffectiveReturn;
-  attr_.return_closure_type = UniquePtrForType<EffectiveReturn>();
-}
-
-template <class T>
-inline void Handler<T>::AddCleanup(upb_handlers* h) const {
-  UPB_ASSERT(!registered_);
-  registered_ = true;
-  if (cleanup_func_) {
-    bool ok = upb_handlers_addcleanup(h, cleanup_data_, cleanup_func_);
-    UPB_ASSERT(ok);
-  }
-}
-
-}  /* namespace upb */
-
-#endif  /* __cplusplus */
-
-
-#undef UPB_TWO_32BIT_TYPES
-#undef UPB_TWO_64BIT_TYPES
-#undef UPB_INT32_T
-#undef UPB_UINT32_T
-#undef UPB_INT32ALT_T
-#undef UPB_UINT32ALT_T
-#undef UPB_INT64_T
-#undef UPB_UINT64_T
-#undef UPB_INT64ALT_T
-#undef UPB_UINT64ALT_T
-
-
-#endif  /* UPB_HANDLERS_INL_H_ */
-
-#endif  /* UPB_HANDLERS_H */
-/*
-** upb::Sink (upb_sink)
-** upb::BytesSink (upb_bytessink)
-**
-** A upb_sink is an object that binds a upb_handlers object to some runtime
-** state.  It is the object that can actually receive data via the upb_handlers
-** interface.
-**
-** Unlike upb_def and upb_handlers, upb_sink is never frozen, immutable, or
-** thread-safe.  You can create as many of them as you want, but each one may
-** only be used in a single thread at a time.
-**
-** If we compare with class-based OOP, a you can think of a upb_def as an
-** abstract base class, a upb_handlers as a concrete derived class, and a
-** upb_sink as an object (class instance).
-*/
-
-#ifndef UPB_SINK_H
-#define UPB_SINK_H
-
-
-
-#ifdef __cplusplus
-namespace upb {
-class BytesSink;
-class Sink;
-}
-#endif
-
-/* upb_sink *******************************************************************/
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-typedef struct {
-  const upb_handlers *handlers;
-  void *closure;
-} upb_sink;
-
-#define PUTVAL(type, ctype)                                           \
-  UPB_INLINE bool upb_sink_put##type(upb_sink s, upb_selector_t sel,  \
-                                     ctype val) {                     \
-    typedef upb_##type##_handlerfunc functype;                        \
-    functype *func;                                                   \
-    const void *hd;                                                   \
-    if (!s.handlers) return true;                                     \
-    func = (functype *)upb_handlers_gethandler(s.handlers, sel, &hd); \
-    if (!func) return true;                                           \
-    return func(s.closure, hd, val);                                  \
-  }
-
-PUTVAL(int32,  int32_t)
-PUTVAL(int64,  int64_t)
-PUTVAL(uint32, uint32_t)
-PUTVAL(uint64, uint64_t)
-PUTVAL(float,  float)
-PUTVAL(double, double)
-PUTVAL(bool,   bool)
-#undef PUTVAL
-
-UPB_INLINE void upb_sink_reset(upb_sink *s, const upb_handlers *h, void *c) {
-  s->handlers = h;
-  s->closure = c;
-}
-
-UPB_INLINE size_t upb_sink_putstring(upb_sink s, upb_selector_t sel,
-                                     const char *buf, size_t n,
-                                     const upb_bufhandle *handle) {
-  typedef upb_string_handlerfunc func;
-  func *handler;
-  const void *hd;
-  if (!s.handlers) return n;
-  handler = (func *)upb_handlers_gethandler(s.handlers, sel, &hd);
-
-  if (!handler) return n;
-  return handler(s.closure, hd, buf, n, handle);
-}
-
-UPB_INLINE bool upb_sink_putunknown(upb_sink s, const char *buf, size_t n) {
-  typedef upb_unknown_handlerfunc func;
-  func *handler;
-  const void *hd;
-  if (!s.handlers) return true;
-  handler =
-      (func *)upb_handlers_gethandler(s.handlers, UPB_UNKNOWN_SELECTOR, &hd);
-
-  if (!handler) return n;
-  return handler(s.closure, hd, buf, n);
-}
-
-UPB_INLINE bool upb_sink_startmsg(upb_sink s) {
-  typedef upb_startmsg_handlerfunc func;
-  func *startmsg;
-  const void *hd;
-  if (!s.handlers) return true;
-  startmsg =
-      (func *)upb_handlers_gethandler(s.handlers, UPB_STARTMSG_SELECTOR, &hd);
-
-  if (!startmsg) return true;
-  return startmsg(s.closure, hd);
-}
-
-UPB_INLINE bool upb_sink_endmsg(upb_sink s, upb_status *status) {
-  typedef upb_endmsg_handlerfunc func;
-  func *endmsg;
-  const void *hd;
-  if (!s.handlers) return true;
-  endmsg =
-      (func *)upb_handlers_gethandler(s.handlers, UPB_ENDMSG_SELECTOR, &hd);
-
-  if (!endmsg) return true;
-  return endmsg(s.closure, hd, status);
-}
-
-UPB_INLINE bool upb_sink_startseq(upb_sink s, upb_selector_t sel,
-                                  upb_sink *sub) {
-  typedef upb_startfield_handlerfunc func;
-  func *startseq;
-  const void *hd;
-  sub->closure = s.closure;
-  sub->handlers = s.handlers;
-  if (!s.handlers) return true;
-  startseq = (func*)upb_handlers_gethandler(s.handlers, sel, &hd);
-
-  if (!startseq) return true;
-  sub->closure = startseq(s.closure, hd);
-  return sub->closure ? true : false;
-}
-
-UPB_INLINE bool upb_sink_endseq(upb_sink s, upb_selector_t sel) {
-  typedef upb_endfield_handlerfunc func;
-  func *endseq;
-  const void *hd;
-  if (!s.handlers) return true;
-  endseq = (func*)upb_handlers_gethandler(s.handlers, sel, &hd);
-
-  if (!endseq) return true;
-  return endseq(s.closure, hd);
-}
-
-UPB_INLINE bool upb_sink_startstr(upb_sink s, upb_selector_t sel,
-                                  size_t size_hint, upb_sink *sub) {
-  typedef upb_startstr_handlerfunc func;
-  func *startstr;
-  const void *hd;
-  sub->closure = s.closure;
-  sub->handlers = s.handlers;
-  if (!s.handlers) return true;
-  startstr = (func*)upb_handlers_gethandler(s.handlers, sel, &hd);
-
-  if (!startstr) return true;
-  sub->closure = startstr(s.closure, hd, size_hint);
-  return sub->closure ? true : false;
-}
-
-UPB_INLINE bool upb_sink_endstr(upb_sink s, upb_selector_t sel) {
-  typedef upb_endfield_handlerfunc func;
-  func *endstr;
-  const void *hd;
-  if (!s.handlers) return true;
-  endstr = (func*)upb_handlers_gethandler(s.handlers, sel, &hd);
-
-  if (!endstr) return true;
-  return endstr(s.closure, hd);
-}
-
-UPB_INLINE bool upb_sink_startsubmsg(upb_sink s, upb_selector_t sel,
-                                     upb_sink *sub) {
-  typedef upb_startfield_handlerfunc func;
-  func *startsubmsg;
-  const void *hd;
-  sub->closure = s.closure;
-  if (!s.handlers) {
-    sub->handlers = NULL;
-    return true;
-  }
-  sub->handlers = upb_handlers_getsubhandlers_sel(s.handlers, sel);
-  startsubmsg = (func*)upb_handlers_gethandler(s.handlers, sel, &hd);
-
-  if (!startsubmsg) return true;
-  sub->closure = startsubmsg(s.closure, hd);
-  return sub->closure ? true : false;
-}
-
-UPB_INLINE bool upb_sink_endsubmsg(upb_sink s, upb_sink sub,
-                                   upb_selector_t sel) {
-  typedef upb_endfield_handlerfunc func;
-  func *endsubmsg;
-  const void *hd;
-  if (!s.handlers) return true;
-  endsubmsg = (func*)upb_handlers_gethandler(s.handlers, sel, &hd);
-
-  if (!endsubmsg) return true;
-  return endsubmsg(sub.closure, hd);
-}
-
-#ifdef __cplusplus
-}  /* extern "C" */
-
-/* A upb::Sink is an object that binds a upb::Handlers object to some runtime
- * state.  It represents an endpoint to which data can be sent.
- *
- * TODO(haberman): right now all of these functions take selectors.  Should they
- * take selectorbase instead?
- *
- * ie. instead of calling:
- *   sink->StartString(FOO_FIELD_START_STRING, ...)
- * a selector base would let you say:
- *   sink->StartString(FOO_FIELD, ...)
- *
- * This would make call sites a little nicer and require emitting fewer selector
- * definitions in .h files.
- *
- * But the current scheme has the benefit that you can retrieve a function
- * pointer for any handler with handlers->GetHandler(selector), without having
- * to have a separate GetHandler() function for each handler type.  The JIT
- * compiler uses this.  To accommodate we'd have to expose a separate
- * GetHandler() for every handler type.
- *
- * Also to ponder: selectors right now are independent of a specific Handlers
- * instance.  In other words, they allocate a number to every possible handler
- * that *could* be registered, without knowing anything about what handlers
- * *are* registered.  That means that using selectors as table offsets prohibits
- * us from compacting the handler table at Freeze() time.  If the table is very
- * sparse, this could be wasteful.
- *
- * Having another selector-like thing that is specific to a Handlers instance
- * would allow this compacting, but then it would be impossible to write code
- * ahead-of-time that can be bound to any Handlers instance at runtime.  For
- * example, a .proto file parser written as straight C will not know what
- * Handlers it will be bound to, so when it calls sink->StartString() what
- * selector will it pass?  It needs a selector like we have today, that is
- * independent of any particular upb::Handlers.
- *
- * Is there a way then to allow Handlers table compaction? */
-class upb::Sink {
- public:
-  /* Constructor with no initialization; must be Reset() before use. */
-  Sink() {}
-
-  Sink(const Sink&) = default;
-  Sink& operator=(const Sink&) = default;
-
-  Sink(const upb_sink& sink) : sink_(sink) {}
-  Sink &operator=(const upb_sink &sink) {
-    sink_ = sink;
-    return *this;
-  }
-
-  upb_sink sink() { return sink_; }
-
-  /* Constructs a new sink for the given frozen handlers and closure.
-   *
-   * TODO: once the Handlers know the expected closure type, verify that T
-   * matches it. */
-  template <class T> Sink(const upb_handlers* handlers, T* closure) {
-    Reset(handlers, closure);
-  }
-
-  upb_sink* ptr() { return &sink_; }
-
-  /* Resets the value of the sink. */
-  template <class T> void Reset(const upb_handlers* handlers, T* closure) {
-    upb_sink_reset(&sink_, handlers, closure);
-  }
-
-  /* Returns the top-level object that is bound to this sink.
-   *
-   * TODO: once the Handlers know the expected closure type, verify that T
-   * matches it. */
-  template <class T> T* GetObject() const {
-    return static_cast<T*>(sink_.closure);
-  }
-
-  /* Functions for pushing data into the sink.
-   *
-   * These return false if processing should stop (either due to error or just
-   * to suspend).
-   *
-   * These may not be called from within one of the same sink's handlers (in
-   * other words, handlers are not re-entrant). */
-
-  /* Should be called at the start and end of every message; both the top-level
-   * message and submessages.  This means that submessages should use the
-   * following sequence:
-   *   sink->StartSubMessage(startsubmsg_selector);
-   *   sink->StartMessage();
-   *   // ...
-   *   sink->EndMessage(&status);
-   *   sink->EndSubMessage(endsubmsg_selector); */
-  bool StartMessage() { return upb_sink_startmsg(sink_); }
-  bool EndMessage(upb_status *status) {
-    return upb_sink_endmsg(sink_, status);
-  }
-
-  /* Putting of individual values.  These work for both repeated and
-   * non-repeated fields, but for repeated fields you must wrap them in
-   * calls to StartSequence()/EndSequence(). */
-  bool PutInt32(HandlersPtr::Selector s, int32_t val) {
-    return upb_sink_putint32(sink_, s, val);
-  }
-
-  bool PutInt64(HandlersPtr::Selector s, int64_t val) {
-    return upb_sink_putint64(sink_, s, val);
-  }
-
-  bool PutUInt32(HandlersPtr::Selector s, uint32_t val) {
-    return upb_sink_putuint32(sink_, s, val);
-  }
-
-  bool PutUInt64(HandlersPtr::Selector s, uint64_t val) {
-    return upb_sink_putuint64(sink_, s, val);
-  }
-
-  bool PutFloat(HandlersPtr::Selector s, float val) {
-    return upb_sink_putfloat(sink_, s, val);
-  }
-
-  bool PutDouble(HandlersPtr::Selector s, double val) {
-    return upb_sink_putdouble(sink_, s, val);
-  }
-
-  bool PutBool(HandlersPtr::Selector s, bool val) {
-    return upb_sink_putbool(sink_, s, val);
-  }
-
-  /* Putting of string/bytes values.  Each string can consist of zero or more
-   * non-contiguous buffers of data.
-   *
-   * For StartString(), the function will write a sink for the string to "sub."
-   * The sub-sink must be used for any/all PutStringBuffer() calls. */
-  bool StartString(HandlersPtr::Selector s, size_t size_hint, Sink* sub) {
-    upb_sink sub_c;
-    bool ret = upb_sink_startstr(sink_, s, size_hint, &sub_c);
-    *sub = sub_c;
-    return ret;
-  }
-
-  size_t PutStringBuffer(HandlersPtr::Selector s, const char *buf, size_t len,
-                         const upb_bufhandle *handle) {
-    return upb_sink_putstring(sink_, s, buf, len, handle);
-  }
-
-  bool EndString(HandlersPtr::Selector s) {
-    return upb_sink_endstr(sink_, s);
-  }
-
-  /* For submessage fields.
-   *
-   * For StartSubMessage(), the function will write a sink for the string to
-   * "sub." The sub-sink must be used for any/all handlers called within the
-   * submessage. */
-  bool StartSubMessage(HandlersPtr::Selector s, Sink* sub) {
-    upb_sink sub_c;
-    bool ret = upb_sink_startsubmsg(sink_, s, &sub_c);
-    *sub = sub_c;
-    return ret;
-  }
-
-  bool EndSubMessage(HandlersPtr::Selector s, Sink sub) {
-    return upb_sink_endsubmsg(sink_, sub.sink_, s);
-  }
-
-  /* For repeated fields of any type, the sequence of values must be wrapped in
-   * these calls.
-   *
-   * For StartSequence(), the function will write a sink for the string to
-   * "sub." The sub-sink must be used for any/all handlers called within the
-   * sequence. */
-  bool StartSequence(HandlersPtr::Selector s, Sink* sub) {
-    upb_sink sub_c;
-    bool ret = upb_sink_startseq(sink_, s, &sub_c);
-    *sub = sub_c;
-    return ret;
-  }
-
-  bool EndSequence(HandlersPtr::Selector s) {
-    return upb_sink_endseq(sink_, s);
-  }
-
-  /* Copy and assign specifically allowed.
-   * We don't even bother making these members private because so many
-   * functions need them and this is mainly just a dumb data container anyway.
-   */
-
- private:
-  upb_sink sink_;
-};
-
-#endif  /* __cplusplus */
-
-/* upb_bytessink **************************************************************/
-
-typedef struct {
-  const upb_byteshandler *handler;
-  void *closure;
-} upb_bytessink ;
-
-UPB_INLINE void upb_bytessink_reset(upb_bytessink* s, const upb_byteshandler *h,
-                                    void *closure) {
-  s->handler = h;
-  s->closure = closure;
-}
-
-UPB_INLINE bool upb_bytessink_start(upb_bytessink s, size_t size_hint,
-                                    void **subc) {
-  typedef upb_startstr_handlerfunc func;
-  func *start;
-  *subc = s.closure;
-  if (!s.handler) return true;
-  start = (func *)s.handler->table[UPB_STARTSTR_SELECTOR].func;
-
-  if (!start) return true;
-  *subc = start(s.closure,
-                s.handler->table[UPB_STARTSTR_SELECTOR].attr.handler_data,
-                size_hint);
-  return *subc != NULL;
-}
-
-UPB_INLINE size_t upb_bytessink_putbuf(upb_bytessink s, void *subc,
-                                       const char *buf, size_t size,
-                                       const upb_bufhandle* handle) {
-  typedef upb_string_handlerfunc func;
-  func *putbuf;
-  if (!s.handler) return true;
-  putbuf = (func *)s.handler->table[UPB_STRING_SELECTOR].func;
-
-  if (!putbuf) return true;
-  return putbuf(subc, s.handler->table[UPB_STRING_SELECTOR].attr.handler_data,
-                buf, size, handle);
-}
-
-UPB_INLINE bool upb_bytessink_end(upb_bytessink s) {
-  typedef upb_endfield_handlerfunc func;
-  func *end;
-  if (!s.handler) return true;
-  end = (func *)s.handler->table[UPB_ENDSTR_SELECTOR].func;
-
-  if (!end) return true;
-  return end(s.closure,
-             s.handler->table[UPB_ENDSTR_SELECTOR].attr.handler_data);
-}
-
-#ifdef __cplusplus
-
-class upb::BytesSink {
- public:
-  BytesSink() {}
-
-  BytesSink(const BytesSink&) = default;
-  BytesSink& operator=(const BytesSink&) = default;
-
-  BytesSink(const upb_bytessink& sink) : sink_(sink) {}
-  BytesSink &operator=(const upb_bytessink &sink) {
-    sink_ = sink;
-    return *this;
-  }
-
-  upb_bytessink sink() { return sink_; }
-
-  /* Constructs a new sink for the given frozen handlers and closure.
-   *
-   * TODO(haberman): once the Handlers know the expected closure type, verify
-   * that T matches it. */
-  template <class T> BytesSink(const upb_byteshandler* handler, T* closure) {
-    upb_bytessink_reset(sink_, handler, closure);
-  }
-
-  /* Resets the value of the sink. */
-  template <class T> void Reset(const upb_byteshandler* handler, T* closure) {
-    upb_bytessink_reset(&sink_, handler, closure);
-  }
-
-  bool Start(size_t size_hint, void **subc) {
-    return upb_bytessink_start(sink_, size_hint, subc);
-  }
-
-  size_t PutBuffer(void *subc, const char *buf, size_t len,
-                   const upb_bufhandle *handle) {
-    return upb_bytessink_putbuf(sink_, subc, buf, len, handle);
-  }
-
-  bool End() {
-    return upb_bytessink_end(sink_);
-  }
-
- private:
-  upb_bytessink sink_;
-};
-
-#endif  /* __cplusplus */
-
-/* upb_bufsrc *****************************************************************/
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-bool upb_bufsrc_putbuf(const char *buf, size_t len, upb_bytessink sink);
-
-#ifdef __cplusplus
-}  /* extern "C" */
-
-namespace upb {
-template <class T> bool PutBuffer(const T& str, BytesSink sink) {
-  return upb_bufsrc_putbuf(str.data(), str.size(), sink.sink());
-}
-}
-
-#endif  /* __cplusplus */
-
-
-#endif
-/*
-** Internal-only definitions for the decoder.
-*/
-
-#ifndef UPB_DECODER_INT_H_
-#define UPB_DECODER_INT_H_
-
-/*
-** upb::pb::Decoder
-**
-** A high performance, streaming, resumable decoder for the binary protobuf
-** format.
-**
-** This interface works the same regardless of what decoder backend is being
-** used.  A client of this class does not need to know whether decoding is using
-** a JITted decoder (DynASM, LLVM, etc) or an interpreted decoder.  By default,
-** it will always use the fastest available decoder.  However, you can call
-** set_allow_jit(false) to disable any JIT decoder that might be available.
-** This is primarily useful for testing purposes.
-*/
-
-#ifndef UPB_DECODER_H_
-#define UPB_DECODER_H_
-
-
-#ifdef __cplusplus
-namespace upb {
-namespace pb {
-class CodeCache;
-class DecoderPtr;
-class DecoderMethodPtr;
-class DecoderMethodOptions;
-}  /* namespace pb */
-}  /* namespace upb */
-#endif
-
-/* The maximum number of bytes we are required to buffer internally between
- * calls to the decoder.  The value is 14: a 5 byte unknown tag plus ten-byte
- * varint, less one because we are buffering an incomplete value.
- *
- * Should only be used by unit tests. */
-#define UPB_DECODER_MAX_RESIDUAL_BYTES 14
-
-/* upb_pbdecodermethod ********************************************************/
-
-struct upb_pbdecodermethod;
-typedef struct upb_pbdecodermethod upb_pbdecodermethod;
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-const upb_handlers *upb_pbdecodermethod_desthandlers(
-    const upb_pbdecodermethod *m);
-const upb_byteshandler *upb_pbdecodermethod_inputhandler(
-    const upb_pbdecodermethod *m);
-bool upb_pbdecodermethod_isnative(const upb_pbdecodermethod *m);
-
-#ifdef __cplusplus
-}  /* extern "C" */
-
-/* Represents the code to parse a protobuf according to a destination
- * Handlers. */
-class upb::pb::DecoderMethodPtr {
- public:
-  DecoderMethodPtr() : ptr_(nullptr) {}
-  DecoderMethodPtr(const upb_pbdecodermethod* ptr) : ptr_(ptr) {}
-
-  const upb_pbdecodermethod* ptr() { return ptr_; }
-
-  /* The destination handlers that are statically bound to this method.
-   * This method is only capable of outputting to a sink that uses these
-   * handlers. */
-  const Handlers *dest_handlers() const {
-    return upb_pbdecodermethod_desthandlers(ptr_);
-  }
-
-  /* The input handlers for this decoder method. */
-  const BytesHandler* input_handler() const {
-    return upb_pbdecodermethod_inputhandler(ptr_);
-  }
-
-  /* Whether this method is native. */
-  bool is_native() const {
-    return upb_pbdecodermethod_isnative(ptr_);
-  }
-
- private:
-  const upb_pbdecodermethod* ptr_;
-};
-
-#endif
-
-/* upb_pbdecoder **************************************************************/
-
-/* Preallocation hint: decoder won't allocate more bytes than this when first
- * constructed.  This hint may be an overestimate for some build configurations.
- * But if the decoder library is upgraded without recompiling the application,
- * it may be an underestimate. */
-#define UPB_PB_DECODER_SIZE 4416
-
-struct upb_pbdecoder;
-typedef struct upb_pbdecoder upb_pbdecoder;
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-upb_pbdecoder *upb_pbdecoder_create(upb_arena *arena,
-                                    const upb_pbdecodermethod *method,
-                                    upb_sink output, upb_status *status);
-const upb_pbdecodermethod *upb_pbdecoder_method(const upb_pbdecoder *d);
-upb_bytessink upb_pbdecoder_input(upb_pbdecoder *d);
-uint64_t upb_pbdecoder_bytesparsed(const upb_pbdecoder *d);
-size_t upb_pbdecoder_maxnesting(const upb_pbdecoder *d);
-bool upb_pbdecoder_setmaxnesting(upb_pbdecoder *d, size_t max);
-void upb_pbdecoder_reset(upb_pbdecoder *d);
-
-#ifdef __cplusplus
-}  /* extern "C" */
-
-/* A Decoder receives binary protobuf data on its input sink and pushes the
- * decoded data to its output sink. */
-class upb::pb::DecoderPtr {
- public:
-  DecoderPtr() : ptr_(nullptr) {}
-  DecoderPtr(upb_pbdecoder* ptr) : ptr_(ptr) {}
-
-  upb_pbdecoder* ptr() { return ptr_; }
-
-  /* Constructs a decoder instance for the given method, which must outlive this
-   * decoder.  Any errors during parsing will be set on the given status, which
-   * must also outlive this decoder.
-   *
-   * The sink must match the given method. */
-  static DecoderPtr Create(Arena *arena, DecoderMethodPtr method,
-                           upb::Sink output, Status *status) {
-    return DecoderPtr(upb_pbdecoder_create(arena->ptr(), method.ptr(),
-                                           output.sink(), status->ptr()));
-  }
-
-  /* Returns the DecoderMethod this decoder is parsing from. */
-  const DecoderMethodPtr method() const {
-    return DecoderMethodPtr(upb_pbdecoder_method(ptr_));
-  }
-
-  /* The sink on which this decoder receives input. */
-  BytesSink input() { return BytesSink(upb_pbdecoder_input(ptr())); }
-
-  /* Returns number of bytes successfully parsed.
-   *
-   * This can be useful for determining the stream position where an error
-   * occurred.
-   *
-   * This value may not be up-to-date when called from inside a parsing
-   * callback. */
-  uint64_t BytesParsed() { return upb_pbdecoder_bytesparsed(ptr()); }
-
-  /* Gets/sets the parsing nexting limit.  If the total number of nested
-   * submessages and repeated fields hits this limit, parsing will fail.  This
-   * is a resource limit that controls the amount of memory used by the parsing
-   * stack.
-   *
-   * Setting the limit will fail if the parser is currently suspended at a depth
-   * greater than this, or if memory allocation of the stack fails. */
-  size_t max_nesting() { return upb_pbdecoder_maxnesting(ptr()); }
-  bool set_max_nesting(size_t max) { return upb_pbdecoder_maxnesting(ptr()); }
-
-  void Reset() { upb_pbdecoder_reset(ptr()); }
-
-  static const size_t kSize = UPB_PB_DECODER_SIZE;
-
- private:
-  upb_pbdecoder *ptr_;
-};
-
-#endif  /* __cplusplus */
-
-/* upb_pbcodecache ************************************************************/
-
-/* Lazily builds and caches decoder methods that will push data to the given
- * handlers.  The destination handlercache must outlive this object. */
-
-struct upb_pbcodecache;
-typedef struct upb_pbcodecache upb_pbcodecache;
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-upb_pbcodecache *upb_pbcodecache_new(upb_handlercache *dest);
-void upb_pbcodecache_free(upb_pbcodecache *c);
-bool upb_pbcodecache_allowjit(const upb_pbcodecache *c);
-void upb_pbcodecache_setallowjit(upb_pbcodecache *c, bool allow);
-void upb_pbcodecache_setlazy(upb_pbcodecache *c, bool lazy);
-const upb_pbdecodermethod *upb_pbcodecache_get(upb_pbcodecache *c,
-                                               const upb_msgdef *md);
-
-#ifdef __cplusplus
-}  /* extern "C" */
-
-/* A class for caching protobuf processing code, whether bytecode for the
- * interpreted decoder or machine code for the JIT.
- *
- * This class is not thread-safe. */
-class upb::pb::CodeCache {
- public:
-  CodeCache(upb::HandlerCache *dest)
-      : ptr_(upb_pbcodecache_new(dest->ptr()), upb_pbcodecache_free) {}
-  CodeCache(CodeCache&&) = default;
-  CodeCache& operator=(CodeCache&&) = default;
-
-  upb_pbcodecache* ptr() { return ptr_.get(); }
-  const upb_pbcodecache* ptr() const { return ptr_.get(); }
-
-  /* Whether the cache is allowed to generate machine code.  Defaults to true.
-   * There is no real reason to turn it off except for testing or if you are
-   * having a specific problem with the JIT.
-   *
-   * Note that allow_jit = true does not *guarantee* that the code will be JIT
-   * compiled.  If this platform is not supported or the JIT was not compiled
-   * in, the code may still be interpreted. */
-  bool allow_jit() const { return upb_pbcodecache_allowjit(ptr()); }
-
-  /* This may only be called when the object is first constructed, and prior to
-   * any code generation. */
-  void set_allow_jit(bool allow) { upb_pbcodecache_setallowjit(ptr(), allow); }
-
-  /* Should the decoder push submessages to lazy handlers for fields that have
-   * them?  The caller should set this iff the lazy handlers expect data that is
-   * in protobuf binary format and the caller wishes to lazy parse it. */
-  void set_lazy(bool lazy) { upb_pbcodecache_setlazy(ptr(), lazy); }
-
-  /* Returns a DecoderMethod that can push data to the given handlers.
-   * If a suitable method already exists, it will be returned from the cache. */
-  const DecoderMethodPtr Get(MessageDefPtr md) {
-    return DecoderMethodPtr(upb_pbcodecache_get(ptr(), md.ptr()));
-  }
-
- private:
-  std::unique_ptr<upb_pbcodecache, decltype(&upb_pbcodecache_free)> ptr_;
-};
-
-#endif  /* __cplusplus */
-
-#endif  /* UPB_DECODER_H_ */
-
-
-/* Opcode definitions.  The canonical meaning of each opcode is its
- * implementation in the interpreter (the JIT is written to match this).
- *
- * All instructions have the opcode in the low byte.
- * Instruction format for most instructions is:
- *
- * +-------------------+--------+
- * |     arg (24)      | op (8) |
- * +-------------------+--------+
- *
- * Exceptions are indicated below.  A few opcodes are multi-word. */
-typedef enum {
-  /* Opcodes 1-8, 13, 15-18 parse their respective descriptor types.
-   * Arg for all of these is the upb selector for this field. */
-#define T(type) OP_PARSE_ ## type = UPB_DESCRIPTOR_TYPE_ ## type
-  T(DOUBLE), T(FLOAT), T(INT64), T(UINT64), T(INT32), T(FIXED64), T(FIXED32),
-  T(BOOL), T(UINT32), T(SFIXED32), T(SFIXED64), T(SINT32), T(SINT64),
-#undef T
-  OP_STARTMSG       = 9,   /* No arg. */
-  OP_ENDMSG         = 10,  /* No arg. */
-  OP_STARTSEQ       = 11,
-  OP_ENDSEQ         = 12,
-  OP_STARTSUBMSG    = 14,
-  OP_ENDSUBMSG      = 19,
-  OP_STARTSTR       = 20,
-  OP_STRING         = 21,
-  OP_ENDSTR         = 22,
-
-  OP_PUSHTAGDELIM   = 23,  /* No arg. */
-  OP_PUSHLENDELIM   = 24,  /* No arg. */
-  OP_POP            = 25,  /* No arg. */
-  OP_SETDELIM       = 26,  /* No arg. */
-  OP_SETBIGGROUPNUM = 27,  /* two words:
-                            *   | unused (24)     | opc (8) |
-                            *   |        groupnum (32)      | */
-  OP_CHECKDELIM     = 28,
-  OP_CALL           = 29,
-  OP_RET            = 30,
-  OP_BRANCH         = 31,
-
-  /* Different opcodes depending on how many bytes expected. */
-  OP_TAG1           = 32,  /* | match tag (16) | jump target (8) | opc (8) | */
-  OP_TAG2           = 33,  /* | match tag (16) | jump target (8) | opc (8) | */
-  OP_TAGN           = 34,  /* three words: */
-                           /*   | unused (16) | jump target(8) | opc (8) | */
-                           /*   |           match tag 1 (32)             | */
-                           /*   |           match tag 2 (32)             | */
-
-  OP_SETDISPATCH    = 35,  /* N words: */
-                           /*   | unused (24)         | opc | */
-                           /*   | upb_inttable* (32 or 64)  | */
-
-  OP_DISPATCH       = 36,  /* No arg. */
-
-  OP_HALT           = 37   /* No arg. */
-} opcode;
-
-#define OP_MAX OP_HALT
-
-UPB_INLINE opcode getop(uint32_t instr) { return (opcode)(instr & 0xff); }
-
-struct upb_pbcodecache {
-  upb_arena *arena;
-  upb_handlercache *dest;
-  bool allow_jit;
-  bool lazy;
-
-  /* Map of upb_msgdef -> mgroup. */
-  upb_inttable groups;
-};
-
-/* Method group; represents a set of decoder methods that had their code
- * emitted together.  Immutable once created.  */
-typedef struct {
-  /* Maps upb_msgdef/upb_handlers -> upb_pbdecodermethod.  Owned by us.
-   *
-   * Ideally this would be on pbcodecache (if we were actually caching code).
-   * Right now we don't actually cache anything, which is wasteful. */
-  upb_inttable methods;
-
-  /* The bytecode for our methods, if any exists.  Owned by us. */
-  uint32_t *bytecode;
-  uint32_t *bytecode_end;
-} mgroup;
-
-/* The maximum that any submessages can be nested.  Matches proto2's limit.
- * This specifies the size of the decoder's statically-sized array and therefore
- * setting it high will cause the upb::pb::Decoder object to be larger.
- *
- * If necessary we can add a runtime-settable property to Decoder that allow
- * this to be larger than the compile-time setting, but this would add
- * complexity, particularly since we would have to decide how/if to give users
- * the ability to set a custom memory allocation function. */
-#define UPB_DECODER_MAX_NESTING 64
-
-/* Internal-only struct used by the decoder. */
-typedef struct {
-  /* Space optimization note: we store two pointers here that the JIT
-   * doesn't need at all; the upb_handlers* inside the sink and
-   * the dispatch table pointer.  We can optimze so that the JIT uses
-   * smaller stack frames than the interpreter.  The only thing we need
-   * to guarantee is that the fallback routines can find end_ofs. */
-  upb_sink sink;
-
-  /* The absolute stream offset of the end-of-frame delimiter.
-   * Non-delimited frames (groups and non-packed repeated fields) reuse the
-   * delimiter of their parent, even though the frame may not end there.
-   *
-   * NOTE: the JIT stores a slightly different value here for non-top frames.
-   * It stores the value relative to the end of the enclosed message.  But the
-   * top frame is still stored the same way, which is important for ensuring
-   * that calls from the JIT into C work correctly. */
-  uint64_t end_ofs;
-  const uint32_t *base;
-
-  /* 0 indicates a length-delimited field.
-   * A positive number indicates a known group.
-   * A negative number indicates an unknown group. */
-  int32_t groupnum;
-  upb_inttable *dispatch;  /* Not used by the JIT. */
-} upb_pbdecoder_frame;
-
-struct upb_pbdecodermethod {
-  /* While compiling, the base is relative in "ofs", after compiling it is
-   * absolute in "ptr". */
-  union {
-    uint32_t ofs;     /* PC offset of method. */
-    void *ptr;        /* Pointer to bytecode or machine code for this method. */
-  } code_base;
-
-  /* The decoder method group to which this method belongs. */
-  const mgroup *group;
-
-  /* Whether this method is native code or bytecode. */
-  bool is_native_;
-
-  /* The handler one calls to invoke this method. */
-  upb_byteshandler input_handler_;
-
-  /* The destination handlers this method is bound to.  We own a ref. */
-  const upb_handlers *dest_handlers_;
-
-  /* Dispatch table -- used by both bytecode decoder and JIT when encountering a
-   * field number that wasn't the one we were expecting to see.  See
-   * decoder.int.h for the layout of this table. */
-  upb_inttable dispatch;
-};
-
-struct upb_pbdecoder {
-  upb_arena *arena;
-
-  /* Our input sink. */
-  upb_bytessink input_;
-
-  /* The decoder method we are parsing with (owned). */
-  const upb_pbdecodermethod *method_;
-
-  size_t call_len;
-  const uint32_t *pc, *last;
-
-  /* Current input buffer and its stream offset. */
-  const char *buf, *ptr, *end, *checkpoint;
-
-  /* End of the delimited region, relative to ptr, NULL if not in this buf. */
-  const char *delim_end;
-
-  /* End of the delimited region, relative to ptr, end if not in this buf. */
-  const char *data_end;
-
-  /* Overall stream offset of "buf." */
-  uint64_t bufstart_ofs;
-
-  /* Buffer for residual bytes not parsed from the previous buffer. */
-  char residual[UPB_DECODER_MAX_RESIDUAL_BYTES];
-  char *residual_end;
-
-  /* Bytes of data that should be discarded from the input beore we start
-   * parsing again.  We set this when we internally determine that we can
-   * safely skip the next N bytes, but this region extends past the current
-   * user buffer. */
-  size_t skip;
-
-  /* Stores the user buffer passed to our decode function. */
-  const char *buf_param;
-  size_t size_param;
-  const upb_bufhandle *handle;
-
-  /* Our internal stack. */
-  upb_pbdecoder_frame *stack, *top, *limit;
-  const uint32_t **callstack;
-  size_t stack_size;
-
-  upb_status *status;
-};
-
-/* Decoder entry points; used as handlers. */
-void *upb_pbdecoder_startbc(void *closure, const void *pc, size_t size_hint);
-size_t upb_pbdecoder_decode(void *closure, const void *hd, const char *buf,
-                            size_t size, const upb_bufhandle *handle);
-bool upb_pbdecoder_end(void *closure, const void *handler_data);
-
-/* Decoder-internal functions that the JIT calls to handle fallback paths. */
-int32_t upb_pbdecoder_resume(upb_pbdecoder *d, void *p, const char *buf,
-                             size_t size, const upb_bufhandle *handle);
-size_t upb_pbdecoder_suspend(upb_pbdecoder *d);
-int32_t upb_pbdecoder_skipunknown(upb_pbdecoder *d, int32_t fieldnum,
-                                  uint8_t wire_type);
-int32_t upb_pbdecoder_checktag_slow(upb_pbdecoder *d, uint64_t expected);
-int32_t upb_pbdecoder_decode_varint_slow(upb_pbdecoder *d, uint64_t *u64);
-int32_t upb_pbdecoder_decode_f32(upb_pbdecoder *d, uint32_t *u32);
-int32_t upb_pbdecoder_decode_f64(upb_pbdecoder *d, uint64_t *u64);
-void upb_pbdecoder_seterr(upb_pbdecoder *d, const char *msg);
-
-/* Error messages that are shared between the bytecode and JIT decoders. */
-extern const char *kPbDecoderStackOverflow;
-extern const char *kPbDecoderSubmessageTooLong;
-
-/* Access to decoderplan members needed by the decoder. */
-const char *upb_pbdecoder_getopname(unsigned int op);
-
-/* A special label that means "do field dispatch for this message and branch to
- * wherever that takes you." */
-#define LABEL_DISPATCH 0
-
-/* A special slot in the dispatch table that stores the epilogue (ENDMSG and/or
- * RET) for branching to when we find an appropriate ENDGROUP tag. */
-#define DISPATCH_ENDMSG 0
-
-/* It's important to use this invalid wire type instead of 0 (which is a valid
- * wire type). */
-#define NO_WIRE_TYPE 0xff
-
-/* The dispatch table layout is:
- *   [field number] -> [ 48-bit offset ][ 8-bit wt2 ][ 8-bit wt1 ]
- *
- * If wt1 matches, jump to the 48-bit offset.  If wt2 matches, lookup
- * (UPB_MAX_FIELDNUMBER + fieldnum) and jump there.
- *
- * We need two wire types because of packed/non-packed compatibility.  A
- * primitive repeated field can use either wire type and be valid.  While we
- * could key the table on fieldnum+wiretype, the table would be 8x sparser.
- *
- * Storing two wire types in the primary value allows us to quickly rule out
- * the second wire type without needing to do a separate lookup (this case is
- * less common than an unknown field). */
-UPB_INLINE uint64_t upb_pbdecoder_packdispatch(uint64_t ofs, uint8_t wt1,
-                                               uint8_t wt2) {
-  return (ofs << 16) | (wt2 << 8) | wt1;
-}
-
-UPB_INLINE void upb_pbdecoder_unpackdispatch(uint64_t dispatch, uint64_t *ofs,
-                                             uint8_t *wt1, uint8_t *wt2) {
-  *wt1 = (uint8_t)dispatch;
-  *wt2 = (uint8_t)(dispatch >> 8);
-  *ofs = dispatch >> 16;
-}
-
-/* All of the functions in decoder.c that return int32_t return values according
- * to the following scheme:
- *   1. negative values indicate a return code from the following list.
- *   2. positive values indicate that error or end of buffer was hit, and
- *      that the decode function should immediately return the given value
- *      (the decoder state has already been suspended and is ready to be
- *      resumed). */
-#define DECODE_OK -1
-#define DECODE_MISMATCH -2  /* Used only from checktag_slow(). */
-#define DECODE_ENDGROUP -3  /* Used only from checkunknown(). */
-
-#define CHECK_RETURN(x) { int32_t ret = x; if (ret >= 0) return ret; }
-
-
-#endif  /* UPB_DECODER_INT_H_ */
-/*
-** A number of routines for varint manipulation (we keep them all around to
-** have multiple approaches available for benchmarking).
-*/
-
-#ifndef UPB_VARINT_DECODER_H_
-#define UPB_VARINT_DECODER_H_
-
-#include <assert.h>
-#include <stdint.h>
-#include <string.h>
+#ifndef UPB_JSONENCODE_H_
+#define UPB_JSONENCODE_H_
 
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define UPB_MAX_WIRE_TYPE 5
+enum {
+  /* When set, emits 0/default values.  TOOD(haberman): proto3 only? */
+  UPB_JSONENC_EMITDEFAULTS = 1,
 
-/* The maximum number of bytes that it takes to encode a 64-bit varint. */
-#define UPB_PB_VARINT_MAX_LEN 10
+  /* When set, use normal (snake_caes) field names instead of JSON (camelCase)
+     names. */
+  UPB_JSONENC_PROTONAMES = 2
+};
 
-/* Array of the "native" (ie. non-packed-repeated) wire type for the given a
- * descriptor type (upb_descriptortype_t). */
-extern const uint8_t upb_pb_native_wire_types[];
-
-UPB_INLINE uint64_t byteswap64(uint64_t val) {
-  uint64_t byte = 0xff;
-  return (val & (byte << 56) >> 56)
-    | (val & (byte << 48) >> 40)
-    | (val & (byte << 40) >> 24)
-    | (val & (byte << 32) >> 8)
-    | (val & (byte << 24) << 8)
-    | (val & (byte << 16) << 24)
-    | (val & (byte <<  8) << 40)
-    | (val & (byte <<  0) << 56);
-}
-
-/* Zig-zag encoding/decoding **************************************************/
-
-UPB_INLINE int32_t upb_zzdec_32(uint64_t _n) {
-  uint32_t n = (uint32_t)_n;
-  return (n >> 1) ^ -(int32_t)(n & 1);
-}
-UPB_INLINE int64_t upb_zzdec_64(uint64_t n) {
-  return (n >> 1) ^ -(int64_t)(n & 1);
-}
-UPB_INLINE uint32_t upb_zzenc_32(int32_t n) {
-  return ((uint32_t)n << 1) ^ (n >> 31);
-}
-UPB_INLINE uint64_t upb_zzenc_64(int64_t n) {
-  return ((uint64_t)n << 1) ^ (n >> 63);
-}
-
-/* Decoding *******************************************************************/
-
-/* All decoding functions return this struct by value. */
-typedef struct {
-  const char *p;  /* NULL if the varint was unterminated. */
-  uint64_t val;
-} upb_decoderet;
-
-UPB_INLINE upb_decoderet upb_decoderet_make(const char *p, uint64_t val) {
-  upb_decoderet ret;
-  ret.p = p;
-  ret.val = val;
-  return ret;
-}
-
-upb_decoderet upb_vdecode_max8_branch32(upb_decoderet r);
-upb_decoderet upb_vdecode_max8_branch64(upb_decoderet r);
-
-/* Template for a function that checks the first two bytes with branching
- * and dispatches 2-10 bytes with a separate function.  Note that this may read
- * up to 10 bytes, so it must not be used unless there are at least ten bytes
- * left in the buffer! */
-#define UPB_VARINT_DECODER_CHECK2(name, decode_max8_function)                  \
-UPB_INLINE upb_decoderet upb_vdecode_check2_ ## name(const char *_p) {         \
-  uint8_t *p = (uint8_t*)_p;                                                   \
-  upb_decoderet r;                                                             \
-  if ((*p & 0x80) == 0) {                                                      \
-  /* Common case: one-byte varint. */                                          \
-    return upb_decoderet_make(_p + 1, *p & 0x7fU);                             \
-  }                                                                            \
-  r = upb_decoderet_make(_p + 2, (*p & 0x7fU) | ((*(p + 1) & 0x7fU) << 7));    \
-  if ((*(p + 1) & 0x80) == 0) {                                                \
-    /* Two-byte varint. */                                                     \
-    return r;                                                                  \
-  }                                                                            \
-  /* Longer varint, fallback to out-of-line function. */                       \
-  return decode_max8_function(r);                                              \
-}
-
-UPB_VARINT_DECODER_CHECK2(branch32, upb_vdecode_max8_branch32)
-UPB_VARINT_DECODER_CHECK2(branch64, upb_vdecode_max8_branch64)
-#undef UPB_VARINT_DECODER_CHECK2
-
-/* Our canonical functions for decoding varints, based on the currently
- * favored best-performing implementations. */
-UPB_INLINE upb_decoderet upb_vdecode_fast(const char *p) {
-  if (sizeof(long) == 8)
-    return upb_vdecode_check2_branch64(p);
-  else
-    return upb_vdecode_check2_branch32(p);
-}
-
-
-/* Encoding *******************************************************************/
-
-UPB_INLINE int upb_value_size(uint64_t val) {
-#ifdef __GNUC__
-  int high_bit = 63 - __builtin_clzll(val);  /* 0-based, undef if val == 0. */
-#else
-  int high_bit = 0;
-  uint64_t tmp = val;
-  while(tmp >>= 1) high_bit++;
-#endif
-  return val == 0 ? 1 : high_bit / 8 + 1;
-}
-
-/* Encodes a 64-bit varint into buf (which must be >=UPB_PB_VARINT_MAX_LEN
- * bytes long), returning how many bytes were used.
+/* Encodes the given |msg| to JSON format.  The message's reflection is given in
+ * |m|.  The symtab in |symtab| is used to find extensions (if NULL, extensions
+ * will not be printed).
  *
- * TODO: benchmark and optimize if necessary. */
-UPB_INLINE size_t upb_vencode64(uint64_t val, char *buf) {
-  size_t i;
-  if (val == 0) { buf[0] = 0; return 1; }
-  i = 0;
-  while (val) {
-    uint8_t byte = val & 0x7fU;
-    val >>= 7;
-    if (val) byte |= 0x80U;
-    buf[i++] = byte;
-  }
-  return i;
-}
-
-UPB_INLINE size_t upb_varint_size(uint64_t val) {
-  char buf[UPB_PB_VARINT_MAX_LEN];
-  return upb_vencode64(val, buf);
-}
-
-/* Encodes a 32-bit varint, *not* sign-extended. */
-UPB_INLINE uint64_t upb_vencode32(uint32_t val) {
-  char buf[UPB_PB_VARINT_MAX_LEN];
-  size_t bytes = upb_vencode64(val, buf);
-  uint64_t ret = 0;
-  UPB_ASSERT(bytes <= 5);
-  memcpy(&ret, buf, bytes);
-#ifdef UPB_BIG_ENDIAN
-  ret = byteswap64(ret);
-#endif
-  UPB_ASSERT(ret <= 0xffffffffffU);
-  return ret;
-}
+ * Output is placed in the given buffer, and always NULL-terminated.  The output
+ * size (excluding NULL) is returned.  This means that a return value >= |size|
+ * implies that the output was truncated.  (These are the same semantics as
+ * snprintf()). */
+size_t upb_json_encode(const upb_msg *msg, const upb_msgdef *m,
+                       const upb_symtab *ext_pool, int options, char *buf,
+                       size_t size, upb_status *status);
 
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif
 
-
-#endif  /* UPB_VARINT_DECODER_H_ */
-/*
-** upb::pb::Encoder (upb_pb_encoder)
-**
-** Implements a set of upb_handlers that write protobuf data to the binary wire
-** format.
-**
-** This encoder implementation does not have any access to any out-of-band or
-** precomputed lengths for submessages, so it must buffer submessages internally
-** before it can emit the first byte.
-*/
-
-#ifndef UPB_ENCODER_H_
-#define UPB_ENCODER_H_
-
-
-#ifdef __cplusplus
-namespace upb {
-namespace pb {
-class EncoderPtr;
-}  /* namespace pb */
-}  /* namespace upb */
-#endif
-
-#define UPB_PBENCODER_MAX_NESTING 100
-
-/* upb_pb_encoder *************************************************************/
-
-/* Preallocation hint: decoder won't allocate more bytes than this when first
- * constructed.  This hint may be an overestimate for some build configurations.
- * But if the decoder library is upgraded without recompiling the application,
- * it may be an underestimate. */
-#define UPB_PB_ENCODER_SIZE 784
-
-struct upb_pb_encoder;
-typedef struct upb_pb_encoder upb_pb_encoder;
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-upb_sink upb_pb_encoder_input(upb_pb_encoder *p);
-upb_pb_encoder* upb_pb_encoder_create(upb_arena* a, const upb_handlers* h,
-                                      upb_bytessink output);
-
-/* Lazily builds and caches handlers that will push encoded data to a bytessink.
- * Any msgdef objects used with this object must outlive it. */
-upb_handlercache *upb_pb_encoder_newcache(void);
-
-#ifdef __cplusplus
-}  /* extern "C" { */
-
-class upb::pb::EncoderPtr {
- public:
-  EncoderPtr(upb_pb_encoder* ptr) : ptr_(ptr) {}
-
-  upb_pb_encoder* ptr() { return ptr_; }
-
-  /* Creates a new encoder in the given environment.  The Handlers must have
-   * come from NewHandlers() below. */
-  static EncoderPtr Create(Arena* arena, const Handlers* handlers,
-                           BytesSink output) {
-    return EncoderPtr(
-        upb_pb_encoder_create(arena->ptr(), handlers, output.sink()));
-  }
-
-  /* The input to the encoder. */
-  upb::Sink input() { return upb_pb_encoder_input(ptr()); }
-
-  /* Creates a new set of handlers for this MessageDef. */
-  static HandlerCache NewCache() {
-    return HandlerCache(upb_pb_encoder_newcache());
-  }
-
-  static const size_t kSize = UPB_PB_ENCODER_SIZE;
-
- private:
-  upb_pb_encoder* ptr_;
-};
-
-#endif  /* __cplusplus */
-
-#endif  /* UPB_ENCODER_H_ */
-/*
-** upb::pb::TextPrinter (upb_textprinter)
-**
-** Handlers for writing to protobuf text format.
-*/
-
-#ifndef UPB_TEXT_H_
-#define UPB_TEXT_H_
-
-
-#ifdef __cplusplus
-namespace upb {
-namespace pb {
-class TextPrinterPtr;
-}  /* namespace pb */
-}  /* namespace upb */
-#endif
-
-/* upb_textprinter ************************************************************/
-
-struct upb_textprinter;
-typedef struct upb_textprinter upb_textprinter;
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-/* C API. */
-upb_textprinter *upb_textprinter_create(upb_arena *arena, const upb_handlers *h,
-                                        upb_bytessink output);
-void upb_textprinter_setsingleline(upb_textprinter *p, bool single_line);
-upb_sink upb_textprinter_input(upb_textprinter *p);
-upb_handlercache *upb_textprinter_newcache(void);
-
-#ifdef __cplusplus
-}  /* extern "C" */
-
-class upb::pb::TextPrinterPtr {
- public:
-  TextPrinterPtr(upb_textprinter* ptr) : ptr_(ptr) {}
-
-  /* The given handlers must have come from NewHandlers().  It must outlive the
-   * TextPrinter. */
-  static TextPrinterPtr Create(Arena *arena, upb::HandlersPtr *handlers,
-                               BytesSink output) {
-    return TextPrinterPtr(
-        upb_textprinter_create(arena->ptr(), handlers->ptr(), output.sink()));
-  }
-
-  void SetSingleLineMode(bool single_line) {
-    upb_textprinter_setsingleline(ptr_, single_line);
-  }
-
-  Sink input() { return upb_textprinter_input(ptr_); }
-
-  /* If handler caching becomes a requirement we can add a code cache as in
-   * decoder.h */
-  static HandlerCache NewCache() {
-    return HandlerCache(upb_textprinter_newcache());
-  }
-
- private:
-  upb_textprinter* ptr_;
-};
-
-#endif
-
-#endif  /* UPB_TEXT_H_ */
-/*
-** upb::json::Parser (upb_json_parser)
-**
-** Parses JSON according to a specific schema.
-** Support for parsing arbitrary JSON (schema-less) will be added later.
-*/
-
-#ifndef UPB_JSON_PARSER_H_
-#define UPB_JSON_PARSER_H_
-
-
-#ifdef __cplusplus
-namespace upb {
-namespace json {
-class CodeCache;
-class ParserPtr;
-class ParserMethodPtr;
-}  /* namespace json */
-}  /* namespace upb */
-#endif
-
-/* upb_json_parsermethod ******************************************************/
-
-struct upb_json_parsermethod;
-typedef struct upb_json_parsermethod upb_json_parsermethod;
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-const upb_byteshandler* upb_json_parsermethod_inputhandler(
-    const upb_json_parsermethod* m);
-
-#ifdef __cplusplus
-}  /* extern "C" */
-
-class upb::json::ParserMethodPtr {
- public:
-  ParserMethodPtr() : ptr_(nullptr) {}
-  ParserMethodPtr(const upb_json_parsermethod* ptr) : ptr_(ptr) {}
-
-  const upb_json_parsermethod* ptr() const { return ptr_; }
-
-  const BytesHandler* input_handler() const {
-    return upb_json_parsermethod_inputhandler(ptr());
-  }
-
- private:
-  const upb_json_parsermethod* ptr_;
-};
-
-#endif  /* __cplusplus */
-
-/* upb_json_parser ************************************************************/
-
-/* Preallocation hint: parser won't allocate more bytes than this when first
- * constructed.  This hint may be an overestimate for some build configurations.
- * But if the parser library is upgraded without recompiling the application,
- * it may be an underestimate. */
-#define UPB_JSON_PARSER_SIZE 5712
-
-struct upb_json_parser;
-typedef struct upb_json_parser upb_json_parser;
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-upb_json_parser* upb_json_parser_create(upb_arena* a,
-                                        const upb_json_parsermethod* m,
-                                        const upb_symtab* symtab,
-                                        upb_sink output,
-                                        upb_status *status,
-                                        bool ignore_json_unknown);
-upb_bytessink upb_json_parser_input(upb_json_parser* p);
-
-#ifdef __cplusplus
-}  /* extern "C" */
-
-/* Parses an incoming BytesStream, pushing the results to the destination
- * sink. */
-class upb::json::ParserPtr {
- public:
-  ParserPtr(upb_json_parser* ptr) : ptr_(ptr) {}
-
-  static ParserPtr Create(Arena* arena, ParserMethodPtr method,
-                          SymbolTable* symtab, Sink output, Status* status,
-                          bool ignore_json_unknown) {
-    upb_symtab* symtab_ptr = symtab ? symtab->ptr() : nullptr;
-    return ParserPtr(upb_json_parser_create(
-        arena->ptr(), method.ptr(), symtab_ptr, output.sink(), status->ptr(),
-        ignore_json_unknown));
-  }
-
-  BytesSink input() { return upb_json_parser_input(ptr_); }
-
- private:
-  upb_json_parser* ptr_;
-};
-
-#endif  /* __cplusplus */
-
-/* upb_json_codecache *********************************************************/
-
-/* Lazily builds and caches decoder methods that will push data to the given
- * handlers.  The upb_symtab object(s) must outlive this object. */
-
-struct upb_json_codecache;
-typedef struct upb_json_codecache upb_json_codecache;
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-upb_json_codecache *upb_json_codecache_new(void);
-void upb_json_codecache_free(upb_json_codecache *cache);
-const upb_json_parsermethod* upb_json_codecache_get(upb_json_codecache* cache,
-                                                    const upb_msgdef* md);
-
-#ifdef __cplusplus
-}  /* extern "C" */
-
-class upb::json::CodeCache {
- public:
-  CodeCache() : ptr_(upb_json_codecache_new(), upb_json_codecache_free) {}
-
-  /* Returns a DecoderMethod that can push data to the given handlers.
-   * If a suitable method already exists, it will be returned from the cache. */
-  ParserMethodPtr Get(MessageDefPtr md) {
-    return upb_json_codecache_get(ptr_.get(), md.ptr());
-  }
-
- private:
-  std::unique_ptr<upb_json_codecache, decltype(&upb_json_codecache_free)> ptr_;
-};
-
-#endif
-
-#endif  /* UPB_JSON_PARSER_H_ */
-/*
-** upb::json::Printer
-**
-** Handlers that emit JSON according to a specific protobuf schema.
-*/
-
-#ifndef UPB_JSON_TYPED_PRINTER_H_
-#define UPB_JSON_TYPED_PRINTER_H_
-
-
-#ifdef __cplusplus
-namespace upb {
-namespace json {
-class PrinterPtr;
-}  /* namespace json */
-}  /* namespace upb */
-#endif
-
-/* upb_json_printer ***********************************************************/
-
-#define UPB_JSON_PRINTER_SIZE 192
-
-struct upb_json_printer;
-typedef struct upb_json_printer upb_json_printer;
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-/* Native C API. */
-upb_json_printer *upb_json_printer_create(upb_arena *a, const upb_handlers *h,
-                                          upb_bytessink output);
-upb_sink upb_json_printer_input(upb_json_printer *p);
-const upb_handlers *upb_json_printer_newhandlers(const upb_msgdef *md,
-                                                 bool preserve_fieldnames,
-                                                 const void *owner);
-
-/* Lazily builds and caches handlers that will push encoded data to a bytessink.
- * Any msgdef objects used with this object must outlive it. */
-upb_handlercache *upb_json_printer_newcache(bool preserve_proto_fieldnames);
-
-#ifdef __cplusplus
-}  /* extern "C" */
-
-/* Prints an incoming stream of data to a BytesSink in JSON format. */
-class upb::json::PrinterPtr {
- public:
-  PrinterPtr(upb_json_printer* ptr) : ptr_(ptr) {}
-
-  static PrinterPtr Create(Arena *arena, const upb::Handlers *handlers,
-                           BytesSink output) {
-    return PrinterPtr(
-        upb_json_printer_create(arena->ptr(), handlers, output.sink()));
-  }
-
-  /* The input to the printer. */
-  Sink input() { return upb_json_printer_input(ptr_); }
-
-  static const size_t kSize = UPB_JSON_PRINTER_SIZE;
-
-  static HandlerCache NewCache(bool preserve_proto_fieldnames) {
-    return upb_json_printer_newcache(preserve_proto_fieldnames);
-  }
-
- private:
-  upb_json_printer* ptr_;
-};
-
-#endif  /* __cplusplus */
-
-#endif  /* UPB_JSON_TYPED_PRINTER_H_ */
+#endif  /* UPB_JSONENCODE_H_ */
 /* See port_def.inc.  This should #undef all macros #defined there. */
 
 #undef UPB_MAPTYPE_STRING
