@@ -321,7 +321,7 @@ StatusOr<uint32> ProtoStreamObjectSource::RenderMap(
 
 Status ProtoStreamObjectSource::RenderPacked(
     const google::protobuf::Field* field, ObjectWriter* ow) const {
-  uint32 length;
+  uint32 length = 0;
   stream_->ReadVarint32(&length);
   int old_limit = stream_->PushLimit(length);
   while (stream_->BytesUntilLimit() > 0) {
