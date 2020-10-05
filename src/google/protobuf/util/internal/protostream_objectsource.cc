@@ -501,7 +501,7 @@ Status ProtoStreamObjectSource::RenderString(const ProtoStreamObjectSource* os,
                                              StringPiece field_name,
                                              ObjectWriter* ow) {
   uint32 tag = os->stream_->ReadTag();
-  uint32 buffer32;
+  uint32 buffer32 = 0;
   std::string str;  // default value of empty for String wrapper
   if (tag != 0) {
     os->stream_->ReadVarint32(&buffer32);  // string size.
